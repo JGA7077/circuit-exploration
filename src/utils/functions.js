@@ -8,24 +8,52 @@ export function convertFalstadToAsc(xmlString) {
   const xmlDoc = parser.parseFromString(xmlString, 'text/xml');
   const cir = xmlDoc.documentElement;
 
+  // 1. Coletar os nomes das saídas configuradas (tags <o> que não têm coordenadas, mas têm nome no atributo x)
+  const outputNames = [];
+  const oConfigs = cir.getElementsByTagName('o');
+  for (let i = 0; i < oConfigs.length; i++) {
+    const el = oConfigs[i];
+    const xAttr = el.getAttribute('x');
+    // Se o xAttr existe e não contém espaços (não é coordenada), é o nome da saída
+    if (xAttr && !xAttr.includes(' ')) {
+      outputNames.push(xAttr);
+    }
+  }
+
   // Estruturas
   const wires = [];           // {x1, y1, x2, y2}
   const components = [];      // {type, x1, y1, x2, y2, value, ref}
   const grounds = [];
   const outputPoints = [];
-  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0 };
+  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0 };
+  let oProbeIndex = 0;
 
   // Processar filhos
   const children = cir.children;
   for (let i = 0; i < children.length; i++) {
     const el = children[i];
-    const tag = el.tagName.toLowerCase();
+    const tag = el.tagName; // manter case original
     const attrs = el.attributes;
     const xAttr = attrs.getNamedItem('x');
     if (!xAttr) continue;
-    const coords = xAttr.value.split(' ').map(Number); // [x1, y1, x2, y2]
+    const xVal = xAttr.value;
 
-    switch (tag) {
+    // Verificar se é uma lista de coordenadas
+    if (!xVal.includes(' ')) continue;
+
+    const coords = xVal.split(' ').map(Number);
+    if (coords.some(isNaN)) continue;
+
+    // Se a tag for 'O' (maiúsculo) ou 'o' com coordenadas, é o componente de sonda/saída
+    if (tag === 'O' || (tag === 'o' && coords.length >= 2)) {
+      const name = outputNames[oProbeIndex++] || `out${oProbeIndex}`;
+      outputPoints.push({ name, x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
+      // Adicionamos o fio físico correspondente à sonda para conectá-la ao circuito
+      wires.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
+      continue;
+    }
+
+    switch (tag.toLowerCase()) {
       case 'w':
         wires.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
         break;
@@ -59,29 +87,36 @@ export function convertFalstadToAsc(xmlString) {
         components.push({ type: 'current', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: maxi, ref });
         break;
       }
+      case 'd': {
+        const ref = `D${++refCount.D}`;
+        components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: '1N4148', ref });
+        break;
+      }
       case 'g':
         grounds.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
-        break;
-      case 'o': // maiúsculo ou minúsculo? No exemplo há <O> (maiúsculo) e <o> (minúsculo com nome)
-        // Vamos tratar ambos: se tiver atributo 'x' com nome, é saída nomeada
-        const nameAttr = attrs.getNamedItem('x');
-        if (nameAttr && isNaN(nameAttr.value)) {
-          // É uma saída nomeada (ex: 'out')
-          outputPoints.push({ name: nameAttr.value, x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
-        } else {
-          // É um conector de saída (sem nome) - podemos ignorar
-        }
         break;
       default:
         break;
     }
   }
 
-  // Se não houver saída nomeada, mas houver <O>, criar uma saída genérica
-  if (outputPoints.length === 0) {
-    // Procurar por <O> que tenha coordenadas e criar uma saída "out"
-    // No exemplo, há <O> com coordenadas, mas não tem nome. Vamos criar um "out" baseado nele.
-    // Mas o exemplo tem <o> com nome, então não precisamos.
+  // Definições de pinos padrão no LTSpice (orientação R0)
+  // Cada símbolo tem pinos em (px, py) relativos à sua origem.
+  const SYMBOL_PINS = {
+    res: { p1: { x: 16, y: 16 }, p2: { x: 16, y: 96 } },
+    cap: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } },
+    ind: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 80 } },
+    voltage: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
+    current: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
+    diode: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } }
+  };
+
+  // Função para rotacionar um ponto (x, y) 90/180/270 graus no sentido horário
+  function rotatePoint(pt, rot) {
+    if (rot === 'R90') return { x: -pt.y, y: pt.x };
+    if (rot === 'R180') return { x: -pt.x, y: -pt.y };
+    if (rot === 'R270') return { x: pt.y, y: -pt.x };
+    return { x: pt.x, y: pt.y };
   }
 
   // Construir o .asc
@@ -95,97 +130,72 @@ export function convertFalstadToAsc(xmlString) {
   });
 
   // 2. Para cada componente, posicionar símbolo e gerar fios de conexão
-  // Definir offset dos pinos (distância do centro ao pino) para cada orientação
-  const PIN_OFFSET = 30; // unidades LTspice (valor típico para resistor, capacitor, etc.)
-
   components.forEach(comp => {
     const { x1, y1, x2, y2, value, ref, type } = comp;
+    
+    // Ponto central aproximado do componente no Falstad
     const cx = (x1 + x2) / 2;
     const cy = (y1 + y2) / 2;
-    // Determinar orientação: se vertical (x1 == x2) -> R90, senão horizontal -> R0
-    const isVertical = (x1 === x2);
-    const rot = isVertical ? 'R90' : 'R0';
 
-    // Mapear tipo para símbolo LTspice
-    let symbol;
-    switch (type) {
-      case 'res': symbol = 'res'; break;
-      case 'cap': symbol = 'cap'; break;
-      case 'ind': symbol = 'ind'; break;
-      case 'voltage': symbol = 'voltage'; break;
-      case 'current': symbol = 'current'; break;
-      default: symbol = 'res';
+    // Determinar rotação e orientação baseada na direção no Falstad
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    let rot = 'R0';
+    if (Math.abs(dx) > Math.abs(dy)) {
+      // Horizontal no Falstad -> R90 no LTSpice (já que resistores/fontes/etc são verticais por padrão em R0)
+      rot = 'R90';
+    } else {
+      // Vertical no Falstad -> R0 no LTSpice
+      rot = 'R0';
     }
 
-    // Escrever SYMBOL no centro
-    asc += `SYMBOL ${symbol} ${Math.round(cx)} ${Math.round(cy)} ${rot}\n`;
+    const pinConfig = SYMBOL_PINS[type] || SYMBOL_PINS.res;
+    
+    // Rotacionar os offsets dos pinos para a orientação desejada
+    const rPin1 = rotatePoint(pinConfig.p1, rot);
+    const rPin2 = rotatePoint(pinConfig.p2, rot);
+
+    // Calcular a posição de origem (âncora) do símbolo no LTspice.
+    // Queremos que a linha entre rPin1 e rPin2 fique alinhada com (x1, y1) e (x2, y2).
+    // O ponto médio dos pinos no LTSpice é: pm_pins = (rPin1 + rPin2) / 2
+    // A origem do símbolo deve ser transladada de forma que pm_pins coincida com o ponto médio do Falstad (cx, cy).
+    const pmx = (rPin1.x + rPin2.x) / 2;
+    const pmy = (rPin1.y + rPin2.y) / 2;
+
+    // Posição de inserção do símbolo (arredondada para a grade de 16 em 16 se possível)
+    const sx = Math.round((cx - pmx) / 16) * 16;
+    const sy = Math.round((cy - pmy) / 16) * 16;
+
+    // Coordenadas finais dos pinos do símbolo inserido
+    const pin1x = sx + rPin1.x;
+    const pin1y = sy + rPin1.y;
+    const pin2x = sx + rPin2.x;
+    const pin2y = sy + rPin2.y;
+
+    // Escrever SYMBOL
+    asc += `SYMBOL ${type} ${sx} ${sy} ${rot}\n`;
     asc += `SYMATTR InstName ${ref}\n`;
-    // Formatar valor: se for resistor >=1000, usar k
+
     let valStr = value.toString();
-    if (type === 'res' && value >= 1000) valStr = (value/1000) + 'k';
+    if (type === 'res' && value >= 1000) valStr = (value / 1000) + 'k';
     asc += `SYMATTR Value ${valStr}\n`;
 
-    // Agora, gerar fios auxiliares para conectar os pinos do símbolo aos pontos de terminação.
-    // Pinos do símbolo:
-    // - Para orientação R0 (horizontal): pino esquerdo em (cx - PIN_OFFSET, cy), direito em (cx + PIN_OFFSET, cy)
-    // - Para orientação R90 (vertical): pino superior em (cx, cy - PIN_OFFSET), inferior em (cx, cy + PIN_OFFSET)
-    let pin1x, pin1y, pin2x, pin2y;
-    if (isVertical) {
-      pin1x = cx; pin1y = cy - PIN_OFFSET; // superior
-      pin2x = cx; pin2y = cy + PIN_OFFSET; // inferior
-    } else {
-      pin1x = cx - PIN_OFFSET; pin1y = cy;
-      pin2x = cx + PIN_OFFSET; pin2y = cy;
-    }
-
-    // Conectar pin1 ao terminal (x1,y1) e pin2 ao (x2,y2)
-    // Mas se o componente for uma fonte de tensão, o pino positivo é o superior (para R0)
-    // Para fontes, precisamos garantir que o positivo esteja conectado ao nó correto.
-    // No Falstad, a fonte é definida com dois pontos. Vamos assumir que o primeiro ponto é o positivo (geralmente em cima).
-    // Então conectamos pin1 (superior) a (x1,y1) e pin2 (inferior) a (x2,y2)
-    // Para outros componentes, a ordem não importa.
-
-    if (type === 'voltage') {
-      // Para fonte, o pino positivo é o de cima (se rot=R0) ou o da esquerda (se rot=R90)
-      // Vamos manter a convenção: pin1 é o que deve ser positivo
-      // No LTspice, o símbolo voltage com orientação R0 tem o terminal positivo em cima.
-      // Se nossa fonte tem x1,y1 (primeiro ponto) acima de x2,y2, então x1,y1 deve conectar ao pino superior.
-      // Vamos verificar a posição relativa:
-      if (y1 < y2) {
-        // x1,y1 é o ponto mais acima, então conectamos ao pino superior (pin1)
-        // e o inferior ao pino inferior (pin2)
-        // Mas já definimos pin1 como superior, então está certo.
-      } else {
-        // Se y1 > y2, então o primeiro ponto é o inferior, invertemos a conexão.
-        // Nesse caso, trocamos os pinos.
-        // Vamos simplesmente conectar (x1,y1) ao pino que estiver mais próximo.
-        // Podemos usar a distância para decidir.
-      }
-      // Para simplicidade, vamos conectar pin1 a (x1,y1) e pin2 a (x2,y2)
-    }
-
-    // Gerar fios auxiliares se as coordenadas forem diferentes
-    if (Math.round(pin1x) !== Math.round(x1) || Math.round(pin1y) !== Math.round(y1)) {
-      asc += `WIRE ${Math.round(pin1x)} ${Math.round(pin1y)} ${Math.round(x1)} ${Math.round(y1)}\n`;
-    }
-    if (Math.round(pin2x) !== Math.round(x2) || Math.round(pin2y) !== Math.round(y2)) {
-      asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(x2)} ${Math.round(y2)}\n`;
-    }
+    // Gerar os fios para conectar os pinos calculados às conexões do Falstad (x1, y1) e (x2, y2)
+    asc += `WIRE ${Math.round(pin1x)} ${Math.round(pin1y)} ${Math.round(x1)} ${Math.round(y1)}\n`;
+    asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(x2)} ${Math.round(y2)}\n`;
   });
 
   // 3. FLAG para o terra
   grounds.forEach(g => {
-    // Usar o primeiro ponto do terra para colocar a flag
     asc += `FLAG ${Math.round(g.x1)} ${Math.round(g.y1)} 0\n`;
   });
 
   // 4. FLAG para saídas nomeadas
   outputPoints.forEach(o => {
-    // Colocar a flag no primeiro ponto (ou na média)
-    asc += `FLAG ${Math.round(o.x1)} ${Math.round(o.y1)} ${o.name}\n`;
+    asc += `FLAG ${Math.round(o.x2)} ${Math.round(o.y2)} ${o.name}\n`;
   });
 
-  // 5. Comando de simulação (padrão: .tran)
+  // 5. Comando de simulação padrão
   asc += 'TEXT -48 312 Left 2 !.tran 100m\n';
 
   return asc;
