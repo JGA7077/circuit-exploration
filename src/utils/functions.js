@@ -25,8 +25,10 @@ export function convertFalstadToAsc(xmlString) {
   const components = [];      // {type, x1, y1, x2, y2, value, ref}
   const grounds = [];
   const outputPoints = [];
-  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0 };
+  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, POT: 0 };
   let oProbeIndex = 0;
+  // armazenar coordenadas do wiper de potenciômetros para ligar ao probe
+  const potWipers = [];
 
   // Processar filhos
   const children = cir.children;
@@ -50,6 +52,11 @@ export function convertFalstadToAsc(xmlString) {
       outputPoints.push({ name, x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
       // Adicionamos o fio físico correspondente à sonda para conectá-la ao circuito
       wires.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
+      // Se houver um wiper de potenciômetro pendente, conectar ao ponto de entrada do probe (primeiro ponto)
+      if (potWipers.length > 0) {
+        const w = potWipers.shift();
+        wires.push({ x1: w.wiperX, y1: w.wiperY, x2: coords[0], y2: coords[1] });
+      }
       continue;
     }
 
@@ -57,6 +64,51 @@ export function convertFalstadToAsc(xmlString) {
       case 'w':
         wires.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
         break;
+      case 'pt': {
+        const maAttr = attrs.getNamedItem('ma');
+        const R_total = maAttr ? parseFloat(maAttr.value) : 10000;
+        const poAttr = attrs.getNamedItem('po');
+        const pos = poAttr ? parseFloat(poAttr.value) : 0.5;
+        const ref = `POT${++refCount.POT}`;
+
+        const dx = coords[2] - coords[0];
+        const dy = coords[3] - coords[1];
+        let rx1_top, ry1_top, rx2_top, ry2_top;
+        let rx1_bot, ry1_bot, rx2_bot, ry2_bot;
+
+        if (Math.abs(dy) > Math.abs(dx)) {
+          // Vertical
+          const wiperX = coords[2];
+          const wiperY = (coords[1] + coords[3]) / 2;
+
+          // Resistor A (top: de top terminal (x1, y2) para wiper)
+          rx1_top = coords[0]; ry1_top = coords[3];
+          rx2_top = wiperX; ry2_top = wiperY;
+
+          // Resistor B (bottom: de wiper para bottom terminal (x1, y1))
+          rx1_bot = wiperX; ry1_bot = wiperY;
+          rx2_bot = coords[0]; ry2_bot = coords[1];
+        } else {
+          // Horizontal
+          const wiperX = (coords[0] + coords[2]) / 2;
+          const wiperY = coords[3];
+
+          // Resistor A (left: de left terminal (x1, y1) para wiper)
+          rx1_top = coords[0]; ry1_top = coords[1];
+          rx2_top = wiperX; ry2_top = wiperY;
+
+          // Resistor B (right: de wiper para right terminal (x2, y1))
+          rx1_bot = wiperX; ry1_bot = wiperY;
+          rx2_bot = coords[2]; ry2_bot = coords[1];
+        }
+
+        const value_top = Math.round(R_total * (1 - pos));
+        const value_bot = Math.round(R_total * pos);
+
+        components.push({ type: 'res', x1: rx1_top, y1: ry1_top, x2: rx2_top, y2: ry2_top, value: value_top, ref: `${ref}_A` });
+        components.push({ type: 'res', x1: rx1_bot, y1: ry1_bot, x2: rx2_bot, y2: ry2_bot, value: value_bot, ref: `${ref}_B` });
+        break;
+      }
       case 'r': {
         const value = parseFloat(attrs.getNamedItem('r').value);
         const ref = `R${++refCount.R}`;
