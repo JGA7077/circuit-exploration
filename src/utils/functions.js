@@ -20,6 +20,9 @@ export function convertFalstadToAsc(xmlString) {
     }
   }
 
+  // Coletar modelos de diodo para gerar .model se necessário
+  const usedDiodeModels = new Set();
+
   // Estruturas
   const wires = [];           // {x1, y1, x2, y2}
   const components = [];      // {type, x1, y1, x2, y2, value, ref}
@@ -148,8 +151,11 @@ export function convertFalstadToAsc(xmlString) {
         break;
       }
       case 'd': {
+        const moAttr = attrs.getNamedItem('mo');
+        const model = moAttr ? moAttr.value : '1N4148';
         const ref = `D${++refCount.D}`;
-        components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: '1N4148', ref });
+        usedDiodeModels.add(model);
+        components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: model, ref });
         break;
       }
       case 'g':
@@ -290,6 +296,16 @@ export function convertFalstadToAsc(xmlString) {
 
   // 5. Comando de simulação padrão
   asc += 'TEXT -48 312 Left 2 !.tran 100m\n';
+
+  // 6. Modelos de diodo não embutidos no LTSpice
+  const builtinDiodes = new Set(['1N4148', '1N914']);
+  let diodeY = 352;
+  usedDiodeModels.forEach(model => {
+    if (!builtinDiodes.has(model)) {
+      asc += `TEXT -48 ${diodeY} Left 2 !.model ${model} D()\n`;
+      diodeY += 40;
+    }
+  });
 
   return asc;
 }
