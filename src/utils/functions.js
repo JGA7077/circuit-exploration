@@ -28,7 +28,8 @@ export function convertFalstadToAsc(xmlString) {
   const components = [];      // {type, x1, y1, x2, y2, value, ref}
   const grounds = [];
   const outputPoints = [];
-  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, POT: 0, PC: 0 };
+  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, POT: 0, PC: 0, Q: 0 };
+  const transistors = [];
   let oProbeIndex = 0;
   // armazenar coordenadas do wiper de potenciômetros para ligar ao probe
   const potWipers = [];
@@ -138,10 +139,13 @@ export function convertFalstadToAsc(xmlString) {
         components.push({ type: 'ind', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
-      case 'v': {
-        const maxv = parseFloat(attrs.getNamedItem('maxv').value);
+      case 'v':
+      case 'varrail': {
+        const maxvAttr = attrs.getNamedItem('maxv');
+        const frAttr = attrs.getNamedItem('fr');
+        const value = frAttr ? parseFloat(frAttr.value) : (maxvAttr ? parseFloat(maxvAttr.value) : 1);
         const ref = `V${++refCount.V}`;
-        components.push({ type: 'voltage', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: maxv, ref });
+        components.push({ type: 'voltage', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
       case 'i': {
@@ -156,6 +160,42 @@ export function convertFalstadToAsc(xmlString) {
         const ref = `D${++refCount.D}`;
         usedDiodeModels.add(model);
         components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: model, ref });
+        break;
+      }
+      case 't': {
+        const pnAttr = attrs.getNamedItem('pn');
+        const moAttrT = attrs.getNamedItem('mo');
+        const isNpn = pnAttr ? pnAttr.value !== '2' : true;
+        const rawModel = moAttrT ? moAttrT.value : 'default';
+        const model = rawModel === 'default' ? (isNpn ? 'NPN' : 'PNP') : rawModel;
+        const type = isNpn ? 'npn' : 'pnp';
+        const ref = `Q${++refCount.Q}`;
+        const dx = coords[2] - coords[0];
+        const dy = coords[3] - coords[1];
+        const off = 16;
+        let bX, bY, cX, cY, eX, eY;
+        if (Math.abs(dx) > Math.abs(dy)) {
+          // Horizontal
+          bX = coords[0]; bY = coords[1];
+          if (isNpn) {
+            cX = coords[2]; cY = coords[3] - off;
+            eX = coords[2]; eY = coords[3] + off;
+          } else {
+            eX = coords[2]; eY = coords[3] - off;
+            cX = coords[2]; cY = coords[3] + off;
+          }
+        } else {
+          // Vertical
+          bX = coords[0]; bY = coords[1];
+          if (isNpn) {
+            cX = coords[2] - off; cY = coords[3];
+            eX = coords[2] + off; eY = coords[3];
+          } else {
+            eX = coords[2] - off; eY = coords[3];
+            cX = coords[2] + off; cY = coords[3];
+          }
+        }
+        transistors.push({ type, bX, bY, cX, cY, eX, eY, model, ref });
         break;
       }
       case 'g':
@@ -174,7 +214,9 @@ export function convertFalstadToAsc(xmlString) {
     ind: { p1: { x: 16, y: 16 }, p2: { x: 16, y: 96 } },
     voltage: { p1: { x: 0, y: 16 }, p2: { x: 0, y: 96 } },
     current: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 80 } },
-    diode: { p1: { x: 16, y: 0 }, p2: { x: 16, y: 64 } }
+    diode: { p1: { x: 16, y: 0 }, p2: { x: 16, y: 64 } },
+    npn: { c: { x: 64, y: 0 }, b: { x: 0, y: 48 }, e: { x: 64, y: 96 } },
+    pnp: { c: { x: 64, y: 0 }, b: { x: 0, y: 48 }, e: { x: 64, y: 96 } }
   };
 
   // Função para rotacionar um ponto (x, y) 90/180/270 graus no sentido horário
@@ -281,6 +323,58 @@ export function convertFalstadToAsc(xmlString) {
     // Gerar fio apenas do pin2 ao terminal oposto
     if (Math.round(pin2x) !== Math.round(wireToX) || Math.round(pin2y) !== Math.round(wireToY)) {
       asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(wireToX)} ${Math.round(wireToY)}\n`;
+    }
+  });
+
+  // 2b. Transistores (3 pinos)
+  transistors.forEach(tr => {
+    const { type, bX, bY, cX, cY, eX, eY, model, ref } = tr;
+    const pinCfg = SYMBOL_PINS[type];
+    // Horizontal layout: C e E compartilham X (empilhados verticalmente)
+    // Vertical layout: C e E compartilham Y (lado a lado horizontalmente)
+    const isHorizontal = Math.abs(cY - eY) >= Math.abs(cX - eX);
+    
+    let rot, sx, sy, cPinX, cPinY, bPinX, bPinY, ePinX, ePinY;
+    if (isHorizontal) {
+      rot = 'R0';
+      sx = Math.round(cX - pinCfg.c.x);
+      sy = Math.round(((cY + eY) / 2) - (pinCfg.c.y + pinCfg.e.y) / 2);
+      const rc = rotatePoint(pinCfg.c, rot);
+      const rb = rotatePoint(pinCfg.b, rot);
+      const re = rotatePoint(pinCfg.e, rot);
+      cPinX = sx + rc.x; cPinY = sy + rc.y;
+      bPinX = sx + rb.x; bPinY = sy + rb.y;
+      ePinX = sx + re.x; ePinY = sy + re.y;
+    } else {
+      rot = 'R90';
+      // Alinhar ponto médio C-E em (cX, eX, y)
+      const midX = Math.min(cX, eX) + Math.abs(cX - eX) / 2;
+      const midY = cY; // C e E compartilham y na vertical
+      const rCH = rotatePoint(pinCfg.c, rot);
+      const rBH = rotatePoint(pinCfg.b, rot);
+      const rEH = rotatePoint(pinCfg.e, rot);
+      const midPinX = (rCH.x + rEH.x) / 2;
+      const midPinY = (rCH.y + rEH.y) / 2;
+      sx = Math.round(midX - midPinX);
+      sy = Math.round(midY - midPinY);
+      cPinX = sx + rCH.x; cPinY = sy + rCH.y;
+      bPinX = sx + rBH.x; bPinY = sy + rBH.y;
+      ePinX = sx + rEH.x; ePinY = sy + rEH.y;
+    }
+
+    asc += `SYMBOL ${type} ${Math.round(sx)} ${Math.round(sy)} ${rot}\n`;
+    asc += `SYMATTR InstName ${ref}\n`;
+    asc += `SYMATTR Value ${model}\n`;
+
+    // Wires de cada pino para o terminal Falstad correspondente
+    if (Math.round(cPinX) !== Math.round(cX) || Math.round(cPinY) !== Math.round(cY)) {
+      asc += `WIRE ${Math.round(cPinX)} ${Math.round(cPinY)} ${Math.round(cX)} ${Math.round(cY)}\n`;
+    }
+    if (Math.round(bPinX) !== Math.round(bX) || Math.round(bPinY) !== Math.round(bY)) {
+      asc += `WIRE ${Math.round(bPinX)} ${Math.round(bPinY)} ${Math.round(bX)} ${Math.round(bY)}\n`;
+    }
+    if (Math.round(ePinX) !== Math.round(eX) || Math.round(ePinY) !== Math.round(eY)) {
+      asc += `WIRE ${Math.round(ePinX)} ${Math.round(ePinY)} ${Math.round(eX)} ${Math.round(eY)}\n`;
     }
   });
 
