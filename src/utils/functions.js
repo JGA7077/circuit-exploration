@@ -38,7 +38,9 @@ export function convertFalstadToAsc(xmlString) {
     const attrs = el.attributes;
     const xAttr = attrs.getNamedItem('x');
     if (!xAttr) continue;
-    const xVal = xAttr.value;
+    let xVal = xAttr.value;
+    // Normalizar non-breaking spaces (\u00a0) para espaços comuns
+    xVal = xVal.replace(/\u00a0/g, ' ');
 
     // Verificar se é uma lista de coordenadas
     if (!xVal.includes(' ')) continue;
@@ -158,16 +160,15 @@ export function convertFalstadToAsc(xmlString) {
     }
   }
 
-  // Definições de pinos padrão no LTSpice (orientação R0)
-  // Cada símbolo tem pinos em (px, py) relativos à sua origem.
+  // Definições de pinos dos símbolos LTSpice 26.0.2 (extraídos dos arquivos .asy)
   const SYMBOL_PINS = {
     res: { p1: { x: 16, y: 16 }, p2: { x: 16, y: 96 } },
-    cap: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } },
-    polcap: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } },
-    ind: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 80 } },
-    voltage: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
-    current: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
-    diode: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } }
+    cap: { p1: { x: 16, y: 0 }, p2: { x: 16, y: 64 } },
+    polcap: { p1: { x: 16, y: 0 }, p2: { x: 16, y: 64 } },
+    ind: { p1: { x: 16, y: 16 }, p2: { x: 16, y: 96 } },
+    voltage: { p1: { x: 0, y: 16 }, p2: { x: 0, y: 96 } },
+    current: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 80 } },
+    diode: { p1: { x: 16, y: 0 }, p2: { x: 16, y: 64 } }
   };
 
   // Função para rotacionar um ponto (x, y) 90/180/270 graus no sentido horário
@@ -221,44 +222,59 @@ export function convertFalstadToAsc(xmlString) {
   components.forEach(comp => {
     const { x1, y1, x2, y2, value, ref, type } = comp;
 
-    // Determinar rotação e orientação baseada na direção no Falstad
     const dx = x2 - x1;
     const dy = y2 - y1;
-    let rot = 'R0';
-    if (Math.abs(dx) > Math.abs(dy)) {
-      rot = 'R90';
+    let rot;
+
+    // Para fontes: pin2 vai em direção a (x1,y1) — direção oposta
+    // Para os demais: pin2 vai em direção a (x2,y2)
+    if (type === 'voltage' || type === 'current') {
+      if (Math.abs(dx) > Math.abs(dy)) {
+        rot = dx < 0 ? 'R270' : 'R90';
+      } else {
+        rot = dy < 0 ? 'R0' : 'R180';
+      }
     } else {
-      rot = 'R0';
+      if (Math.abs(dx) > Math.abs(dy)) {
+        rot = dx > 0 ? 'R270' : 'R90';
+      } else {
+        rot = dy > 0 ? 'R0' : 'R180';
+      }
     }
 
     const pinConfig = SYMBOL_PINS[type] || SYMBOL_PINS.res;
 
-    // Rotacionar os offsets dos pinos para a orientação desejada
     const rPin1 = rotatePoint(pinConfig.p1, rot);
     const rPin2 = rotatePoint(pinConfig.p2, rot);
 
-    // Ancorar o símbolo de modo que pin1 fique EXATAMENTE em (x1, y1).
-    // Isso garante conexão direta sem fio extra no pin1.
-    const sx = Math.round(x1 - rPin1.x);
-    const sy = Math.round(y1 - rPin1.y);
+    let sx, sy, anchorX, anchorY, wireToX, wireToY;
 
-    // Coordenadas finais dos pinos do símbolo inserido
-    const pin1x = sx + rPin1.x; // = x1 (por construção)
-    const pin1y = sy + rPin1.y; // = y1 (por construção)
+    // Para fontes de tensão/corrente: pin1 (+) do LTSpice ancorado no terminal
+    // positivo do Falstad (x2,y2); pin2 vai com fio para o terminal negativo (x1,y1)
+    if (type === 'voltage' || type === 'current') {
+      anchorX = x2; anchorY = y2;
+      wireToX = x1; wireToY = y1;
+    } else {
+      anchorX = x1; anchorY = y1;
+      wireToX = x2; wireToY = y2;
+    }
+
+    // Ancorar o símbolo de modo que pin1 fique no terminal de ancoragem
+    sx = Math.round(anchorX - rPin1.x);
+    sy = Math.round(anchorY - rPin1.y);
+
     const pin2x = sx + rPin2.x;
     const pin2y = sy + rPin2.y;
 
-    // Escrever SYMBOL
     asc += `SYMBOL ${type} ${sx} ${sy} ${rot}\n`;
     asc += `SYMATTR InstName ${ref}\n`;
 
     let valStr = formatValue(value, type);
     asc += `SYMATTR Value ${valStr}\n`;
 
-    // Gerar fio apenas do pin2 ao ponto (x2, y2) do Falstad
-    // O pin1 já está em (x1, y1) — não precisa de fio extra
-    if (pin2x !== Math.round(x2) || pin2y !== Math.round(y2)) {
-      asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(x2)} ${Math.round(y2)}\n`;
+    // Gerar fio apenas do pin2 ao terminal oposto
+    if (Math.round(pin2x) !== Math.round(wireToX) || Math.round(pin2y) !== Math.round(wireToY)) {
+      asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(wireToX)} ${Math.round(wireToY)}\n`;
     }
   });
 
