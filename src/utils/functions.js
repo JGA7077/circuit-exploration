@@ -25,7 +25,7 @@ export function convertFalstadToAsc(xmlString) {
   const components = [];      // {type, x1, y1, x2, y2, value, ref}
   const grounds = [];
   const outputPoints = [];
-  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, POT: 0 };
+  let refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, POT: 0, PC: 0 };
   let oProbeIndex = 0;
   // armazenar coordenadas do wiper de potenciômetros para ligar ao probe
   const potWipers = [];
@@ -121,6 +121,12 @@ export function convertFalstadToAsc(xmlString) {
         components.push({ type: 'cap', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
+      case 'pc': {
+        const value = parseFloat(attrs.getNamedItem('c').value);
+        const ref = `C${++refCount.C}`;
+        components.push({ type: 'polcap', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
+        break;
+      }
       case 'l': {
         const value = parseFloat(attrs.getNamedItem('l').value);
         const ref = `L${++refCount.L}`;
@@ -157,6 +163,7 @@ export function convertFalstadToAsc(xmlString) {
   const SYMBOL_PINS = {
     res: { p1: { x: 16, y: 16 }, p2: { x: 16, y: 96 } },
     cap: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } },
+    polcap: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 64 } },
     ind: { p1: { x: 0, y: 0 }, p2: { x: 0, y: 80 } },
     voltage: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
     current: { p1: { x: 0, y: -80 }, p2: { x: 0, y: 96 } },
@@ -169,6 +176,35 @@ export function convertFalstadToAsc(xmlString) {
     if (rot === 'R180') return { x: -pt.x, y: -pt.y };
     if (rot === 'R270') return { x: pt.y, y: -pt.x };
     return { x: pt.x, y: pt.y };
+  }
+  // Função para formatar valores em notação de engenharia do LTSpice
+  // Usa 'u' (ASCII) ao invés de 'µ' (Unicode) para compatibilidade com .asc
+  function formatValue(val, type) {
+    if (typeof val === 'string') return val; // ex: '1N4148'
+
+    // Capacitores e indutores: valores em Farad/Henry (tipicamente frações pequenas)
+    if (type === 'cap' || type === 'polcap') {
+      if (val >= 1) return parseFloat(val.toPrecision(6)) + '';
+      if (val >= 1e-3) return parseFloat((val * 1e3).toPrecision(6)) + 'm';
+      if (val >= 1e-6) return parseFloat((val * 1e6).toPrecision(6)) + 'u';
+      if (val >= 1e-9) return parseFloat((val * 1e9).toPrecision(6)) + 'n';
+      if (val >= 1e-12) return parseFloat((val * 1e12).toPrecision(6)) + 'p';
+      return val.toExponential();
+    }
+    if (type === 'ind') {
+      if (val >= 1) return parseFloat(val.toPrecision(6)) + '';
+      if (val >= 1e-3) return parseFloat((val * 1e3).toPrecision(6)) + 'm';
+      if (val >= 1e-6) return parseFloat((val * 1e6).toPrecision(6)) + 'u';
+      if (val >= 1e-9) return parseFloat((val * 1e9).toPrecision(6)) + 'n';
+      return val.toExponential();
+    }
+    // Resistores
+    if (type === 'res') {
+      if (val >= 1e6) return parseFloat((val / 1e6).toPrecision(6)) + 'Meg';
+      if (val >= 1e3) return parseFloat((val / 1e3).toPrecision(6)) + 'k';
+      return parseFloat(val.toPrecision(6)) + '';
+    }
+    return val.toString();
   }
 
   // Construir o .asc
@@ -184,43 +220,31 @@ export function convertFalstadToAsc(xmlString) {
   // 2. Para cada componente, posicionar símbolo e gerar fios de conexão
   components.forEach(comp => {
     const { x1, y1, x2, y2, value, ref, type } = comp;
-    
-    // Ponto central aproximado do componente no Falstad
-    const cx = (x1 + x2) / 2;
-    const cy = (y1 + y2) / 2;
 
     // Determinar rotação e orientação baseada na direção no Falstad
     const dx = x2 - x1;
     const dy = y2 - y1;
     let rot = 'R0';
     if (Math.abs(dx) > Math.abs(dy)) {
-      // Horizontal no Falstad -> R90 no LTSpice (já que resistores/fontes/etc são verticais por padrão em R0)
       rot = 'R90';
     } else {
-      // Vertical no Falstad -> R0 no LTSpice
       rot = 'R0';
     }
 
     const pinConfig = SYMBOL_PINS[type] || SYMBOL_PINS.res;
-    
+
     // Rotacionar os offsets dos pinos para a orientação desejada
     const rPin1 = rotatePoint(pinConfig.p1, rot);
     const rPin2 = rotatePoint(pinConfig.p2, rot);
 
-    // Calcular a posição de origem (âncora) do símbolo no LTspice.
-    // Queremos que a linha entre rPin1 e rPin2 fique alinhada com (x1, y1) e (x2, y2).
-    // O ponto médio dos pinos no LTSpice é: pm_pins = (rPin1 + rPin2) / 2
-    // A origem do símbolo deve ser transladada de forma que pm_pins coincida com o ponto médio do Falstad (cx, cy).
-    const pmx = (rPin1.x + rPin2.x) / 2;
-    const pmy = (rPin1.y + rPin2.y) / 2;
-
-    // Posição de inserção do símbolo (arredondada para a grade de 16 em 16 se possível)
-    const sx = Math.round((cx - pmx) / 16) * 16;
-    const sy = Math.round((cy - pmy) / 16) * 16;
+    // Ancorar o símbolo de modo que pin1 fique EXATAMENTE em (x1, y1).
+    // Isso garante conexão direta sem fio extra no pin1.
+    const sx = Math.round(x1 - rPin1.x);
+    const sy = Math.round(y1 - rPin1.y);
 
     // Coordenadas finais dos pinos do símbolo inserido
-    const pin1x = sx + rPin1.x;
-    const pin1y = sy + rPin1.y;
+    const pin1x = sx + rPin1.x; // = x1 (por construção)
+    const pin1y = sy + rPin1.y; // = y1 (por construção)
     const pin2x = sx + rPin2.x;
     const pin2y = sy + rPin2.y;
 
@@ -228,13 +252,14 @@ export function convertFalstadToAsc(xmlString) {
     asc += `SYMBOL ${type} ${sx} ${sy} ${rot}\n`;
     asc += `SYMATTR InstName ${ref}\n`;
 
-    let valStr = value.toString();
-    if (type === 'res' && value >= 1000) valStr = (value / 1000) + 'k';
+    let valStr = formatValue(value, type);
     asc += `SYMATTR Value ${valStr}\n`;
 
-    // Gerar os fios para conectar os pinos calculados às conexões do Falstad (x1, y1) e (x2, y2)
-    asc += `WIRE ${Math.round(pin1x)} ${Math.round(pin1y)} ${Math.round(x1)} ${Math.round(y1)}\n`;
-    asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(x2)} ${Math.round(y2)}\n`;
+    // Gerar fio apenas do pin2 ao ponto (x2, y2) do Falstad
+    // O pin1 já está em (x1, y1) — não precisa de fio extra
+    if (pin2x !== Math.round(x2) || pin2y !== Math.round(y2)) {
+      asc += `WIRE ${Math.round(pin2x)} ${Math.round(pin2y)} ${Math.round(x2)} ${Math.round(y2)}\n`;
+    }
   });
 
   // 3. FLAG para o terra
