@@ -22,6 +22,14 @@ export function convertFalstadToAsc(xmlString) {
 
   // Coletar modelos de diodo para gerar .model se necessário
   const usedDiodeModels = new Set();
+  // Coletar modelos de transistor para gerar .model se necessário
+  const usedTransistorModels = new Set();
+  const builtinTransistors = new Set([
+    'NPN', 'PNP', '2N2222', '2N2907', '2N3904', '2N3906',
+    '2N4401', '2N4403', '2N5088', '2N5089',
+    'BC547', 'BC548', 'BC549', 'BC550', 'BC556', 'BC557', 'BC558', 'BC559', 'BC560',
+    'BD135', 'BD136', 'BD139', 'BD140'
+  ]);
 
   // Estruturas
   const wires = [];           // {x1, y1, x2, y2}
@@ -32,7 +40,9 @@ export function convertFalstadToAsc(xmlString) {
   const transistors = [];
   let oProbeIndex = 0;
   // armazenar coordenadas do wiper de potenciômetros para ligar ao probe
-  const potWipers = [];
+  let potWipers = [];
+  // Modelos de transistor definidos por <tm>
+  const tmModels = {};
 
   // Processar filhos
   const children = cir.children;
@@ -40,6 +50,21 @@ export function convertFalstadToAsc(xmlString) {
     const el = children[i];
     const tag = el.tagName; // manter case original
     const attrs = el.attributes;
+
+    // Processar <tm> antes da verificação de x — não possui coordenadas
+    if (tag.toLowerCase() === 'tm') {
+      const nm = attrs.getNamedItem('nm');
+      if (nm) {
+        tmModels[nm.value] = {};
+        const spiceParams = ['is','ikf','ise','ne','ikr','isc','nc','nf','nr','vaf','var','br','bf','rb','re','rc','cj','vje','mje','cjc','vjc','mjc'];
+        spiceParams.forEach(p => {
+          const a = attrs.getNamedItem(p);
+          if (a) tmModels[nm.value][p.toUpperCase()] = a.value;
+        });
+      }
+      continue;
+    }
+
     const xAttr = attrs.getNamedItem('x');
     if (!xAttr) continue;
     let xVal = xAttr.value;
@@ -68,6 +93,7 @@ export function convertFalstadToAsc(xmlString) {
 
     switch (tag.toLowerCase()) {
       case 'w':
+      case 'rw':
         wires.push({ x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3] });
         break;
       case 'pt': {
@@ -86,6 +112,7 @@ export function convertFalstadToAsc(xmlString) {
           // Vertical
           const wiperX = coords[2];
           const wiperY = (coords[1] + coords[3]) / 2;
+          potWipers.push({ wiperX, wiperY });
 
           // Resistor A (top: de top terminal (x1, y2) para wiper)
           rx1_top = coords[0]; ry1_top = coords[3];
@@ -98,6 +125,7 @@ export function convertFalstadToAsc(xmlString) {
           // Horizontal
           const wiperX = (coords[0] + coords[2]) / 2;
           const wiperY = coords[3];
+          potWipers.push({ wiperX, wiperY });
 
           // Resistor A (left: de left terminal (x1, y1) para wiper)
           rx1_top = coords[0]; ry1_top = coords[1];
@@ -148,6 +176,15 @@ export function convertFalstadToAsc(xmlString) {
         components.push({ type: 'voltage', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
+      case 'sw': {
+        const ref = `V${++refCount.V}`;
+        // Sweeper: primeiro ponto (x1,y1) é a saída para o circuito
+        // Inverter para pin1 (positivo) ficar na saída do sinal
+        components.push({ type: 'voltage', x1: coords[2], y1: coords[3], x2: coords[0], y2: coords[1], value: 'SINE(0 0.2 1000 0 2)', ref });
+        // LTSpice SINE precisa do terminal negativo aterrado
+        grounds.push({ x1: coords[2], y1: coords[3] });
+        break;
+      }
       case 'i': {
         const maxi = parseFloat(attrs.getNamedItem('maxi').value);
         const ref = `I${++refCount.I}`;
@@ -196,6 +233,7 @@ export function convertFalstadToAsc(xmlString) {
           }
         }
         transistors.push({ type, bX, bY, cX, cY, eX, eY, model, ref });
+        usedTransistorModels.add(model);
         break;
       }
       case 'g':
@@ -205,6 +243,29 @@ export function convertFalstadToAsc(xmlString) {
         break;
     }
   }
+
+  // Conectar pot wipers ao endpoint de fio mais próximo
+  potWipers.forEach(w => {
+    let bestX = null, bestY = null, bestDist = Infinity;
+    wires.forEach(wire => {
+      const eps = [{ x: wire.x1, y: wire.y1 }, { x: wire.x2, y: wire.y2 }];
+      eps.forEach(ep => {
+        const d = Math.abs(w.wiperX - ep.x) + Math.abs(w.wiperY - ep.y);
+        if (d < bestDist) { bestDist = d; bestX = ep.x; bestY = ep.y; }
+      });
+    });
+    if (bestDist < 32) {
+      wires.push({ x1: w.wiperX, y1: w.wiperY, x2: bestX, y2: bestY });
+    }
+  });
+
+  // Escalar todas as coordenadas para melhor legibilidade no LTSpice
+  const SCALE = 3;
+  wires.forEach(w => { w.x1 *= SCALE; w.y1 *= SCALE; w.x2 *= SCALE; w.y2 *= SCALE; });
+  components.forEach(c => { c.x1 *= SCALE; c.y1 *= SCALE; c.x2 *= SCALE; c.y2 *= SCALE; });
+  grounds.forEach(g => { g.x1 *= SCALE; g.y1 *= SCALE; if (g.x2) g.x2 *= SCALE; if (g.y2) g.y2 *= SCALE; });
+  outputPoints.forEach(o => { o.x1 *= SCALE; o.y1 *= SCALE; o.x2 *= SCALE; o.y2 *= SCALE; });
+  transistors.forEach(t => { t.bX *= SCALE; t.bY *= SCALE; t.cX *= SCALE; t.cY *= SCALE; t.eX *= SCALE; t.eY *= SCALE; });
 
   // Definições de pinos dos símbolos LTSpice 26.0.2 (extraídos dos arquivos .asy)
   const SYMBOL_PINS = {
@@ -398,6 +459,23 @@ export function convertFalstadToAsc(xmlString) {
     if (!builtinDiodes.has(model)) {
       asc += `TEXT -48 ${diodeY} Left 2 !.model ${model} D()\n`;
       diodeY += 40;
+    }
+  });
+
+  // 7. Modelos de transistor não embutidos no LTSpice
+  let transY = diodeY;
+  usedTransistorModels.forEach(model => {
+    if (!builtinTransistors.has(model.toUpperCase())) {
+      const firstTrans = transistors.find(t => t.model === model);
+      const type = firstTrans ? (firstTrans.type === 'npn' ? 'NPN' : 'PNP') : 'NPN';
+      const params = tmModels[model];
+      let line = `.model ${model} ${type}(`;
+      if (params) {
+        line += Object.entries(params).map(([k, v]) => `${k}=${v}`).join(' ');
+      }
+      line += ')';
+      asc += `TEXT -48 ${transY} Left 2 !${line}\n`;
+      transY += 40;
     }
   });
 
