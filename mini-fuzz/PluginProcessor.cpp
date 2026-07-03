@@ -8,7 +8,6 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         juce::NormalisableRange<float> (0.0f, 24.0f, 0.1f), 12.0f));
     layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output",
         juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
-
     return layout;
 }
 

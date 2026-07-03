@@ -63,7 +63,7 @@ export function parseFalstadXml (xmlString, customDOMParser) {
   const outputs = [];
   const outputNames = [];
 
-  const refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0 };
+  const refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, Q: 0 };
 
   // Coletar nomes de saída (tags <o> sem coordenadas)
   const oConfigs = cir.getElementsByTagName('o');
@@ -122,6 +122,14 @@ export function parseFalstadXml (xmlString, customDOMParser) {
         components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: model, ref });
         break;
       }
+      case 't': {
+        const tVal = parseFloat(attrs.getNamedItem('t').value);
+        const moAttr = attrs.getNamedItem('mo');
+        const model = moAttr ? moAttr.value : (tVal > 0 ? 'NPN' : 'PNP');
+        const ref = `Q${++refCount.Q}`;
+        components.push({ type: tVal > 0 ? 'npn' : 'pnp', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: model, ref });
+        break;
+      }
       case 'g':
         grounds.push({ x: coords[0], y: coords[1] });
         break;
@@ -143,8 +151,23 @@ export function detectTopology (circuit) {
   const caps = components.filter(c => c.type === 'cap');
   const diodes = components.filter(c => c.type === 'diode');
 
-  // Diode clipper: 1+ resistor + 1+ capacitor + 1+ diodo
-  // Detect BEFORE RC low-pass since diodes would also match RC
+  const trans = components.filter(c => c.type === 'npn' || c.type === 'pnp');
+
+  // Mini-fuzz: transistor + 1+ diode + 1+ resistor + 1+ capacitor
+  if (trans.length >= 1 && diodes.length >= 1 && res.length >= 1 && caps.length >= 1) {
+    return {
+      type: 'mini_fuzz',
+      params: {
+        transistor: trans[0].ref,
+        diodeModel: diodes[0].value,
+        numDiodes: diodes.length,
+        numResistors: res.length,
+        numCaps: caps.length
+      }
+    };
+  }
+
+  // Diode clipper: 1+ resistor + 1+ capacitor + 1+ diodo (no transistor)
   if (diodes.length >= 1 && res.length >= 1 && caps.length >= 1) {
     const firstR = res[0];
     const firstC = caps[0];
@@ -399,15 +422,24 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
 private:
-    // WDF tree: ResistiveSource -> Series(R2) -> Parallel(R1 || C1 || DiodePair)
-    wdft::ResistiveVoltageSourceT<float> source;
-    wdft::ResistorT<float> r1, r2;
-    wdft::CapacitorT<float> c1;
-    wdft::DiodePairT<float, decltype(c1)::Next> diodePair;
-    wdft::WDFParallelT<float, decltype(r1)::Next, decltype(diodePair)::Next> p1;
-    wdft::WDFSeriesT<float, decltype(r2)::Next, decltype(p1)::Next> s1;
+    struct WdfCircuit
+    {
+        void prepare (double fs);
+        void reset();
+        float processSample (float x);
 
+        wdft::ResistiveVoltageSourceT<float> Vs;
+        wdft::ResistorT<float> R1 { 4700.0f };
+        wdft::WDFSeriesT<float, decltype(Vs), decltype(R1)> S1 { Vs, R1 };
+        wdft::CapacitorT<float> C1 { 47.0e-9f };
+        wdft::WDFParallelT<float, decltype(S1), decltype(C1)> P1 { S1, C1 };
+        wdft::DiodePairT<float, decltype(P1)> dp { P1, 2.52e-9f };
+    };
+
+    WdfCircuit circuit[2];
     double sampleRate = 44100.0;
+    float drive = 1.0f;
+    float outputLevel = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (${pluginName}AudioProcessor)
 };
@@ -420,9 +452,9 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
     layout.add (std::make_unique<juce::AudioParameterFloat> ("drive", "Drive (dB)",
-        juce::NormalisableRange<float> (-12.0f, 24.0f, 0.1f), 12.0f));
+        juce::NormalisableRange<float> (0.0f, 30.0f, 0.1f), 0.0f));
     layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output (dB)",
-        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
+        juce::NormalisableRange<float> (-30.0f, 6.0f, 0.1f), 0.0f));
 
     return layout;
 }
@@ -430,24 +462,40 @@ static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
 ${pluginName}AudioProcessor::${pluginName}AudioProcessor()
     : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts (*this, nullptr, "Parameters", createParameterLayout()),
-      r1 (1000.0f),
-      r2 (4700.0f),
-      c1 (1.0e-6f),
-      diodePair (2.52e-9f),
-      p1 (r1, diodePair),
-      s1 (r2, p1)
+      apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
 }
 
 void ${pluginName}AudioProcessor::prepareToPlay (double rate, int)
 {
     sampleRate = rate;
-    c1.prepare (rate);
+    for (auto& c : circuit)
+        c.prepare (rate);
 }
 
 void ${pluginName}AudioProcessor::releaseResources()
 {
+    for (auto& c : circuit)
+        c.reset();
+}
+
+void ${pluginName}AudioProcessor::WdfCircuit::prepare (double fs)
+{
+    C1.prepare ((float) fs);
+}
+
+void ${pluginName}AudioProcessor::WdfCircuit::reset()
+{
+    C1.reset();
+}
+
+float ${pluginName}AudioProcessor::WdfCircuit::processSample (float x)
+{
+    Vs.setVoltage ((double) x);
+    dp.incident (P1.reflected());
+    auto y = wdft::voltage<float> (C1);
+    P1.incident (dp.reflected());
+    return y;
 }
 
 void ${pluginName}AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -460,23 +508,198 @@ void ${pluginName}AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
-    float driveLin = std::pow (10.0f, *apvts.getRawParameterValue ("drive") / 20.0f);
-    float outputLin = std::pow (10.0f, *apvts.getRawParameterValue ("output") / 20.0f);
+    drive = *apvts.getRawParameterValue ("drive");
+    outputLevel = *apvts.getRawParameterValue ("output");
 
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    float driveGain = juce::Decibels::decibelsToGain (drive);
+    float outGain = juce::Decibels::decibelsToGain (outputLevel);
+
+    for (int ch = 0; ch < totalNumInputChannels; ++ch)
     {
-        auto* data = buffer.getWritePointer (channel);
+        auto* data = buffer.getWritePointer (ch);
 
-        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        for (int s = 0; s < buffer.getNumSamples(); ++s)
         {
-            float in = data[sample] * driveLin;
+            float x = data[s] * driveGain;
+            x = circuit[ch].processSample (x);
+            data[s] = x * outGain;
+        }
+    }
+}
 
-            source.setVoltage ((double) in);
-            source.incident (s1.reflected());
-            auto y = (float) chowdsp::wdft::voltage<double> (r1);
-            s1.incident (source.reflected());
+juce::AudioProcessorEditor* ${pluginName}AudioProcessor::createEditor()
+{
+    return nullptr;
+}
 
-            data[sample] = y * outputLin;
+void ${pluginName}AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    juce::MemoryOutputStream mos (destData, false);
+    apvts.state.writeToStream (mos);
+}
+
+void ${pluginName}AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    auto tree = juce::ValueTree::readFromData (data, (size_t) sizeInBytes);
+    if (tree.isValid())
+        apvts.replaceState (tree);
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new ${pluginName}AudioProcessor();
+}
+`;
+
+  return { processorH, processorCPP };
+}
+
+function generateMiniFuzz () {
+  const pluginName = 'CircuitPlugin';
+
+  const processorH = `#pragma once
+
+#include <JuceHeader.h>
+#include <chowdsp_wdf/chowdsp_wdf.h>
+
+namespace wdft = chowdsp::wdft;
+
+class ${pluginName}AudioProcessor : public juce::AudioProcessor
+{
+public:
+    ${pluginName}AudioProcessor();
+    ~${pluginName}AudioProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return false; }
+
+    const juce::String getName() const override { return "${pluginName}"; }
+
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
+
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    struct FuzzCircuit
+    {
+        void prepare (double fs);
+        void reset();
+        float processSample (float x);
+
+        wdft::ResistiveVoltageSourceT<float> Vs;
+        wdft::ResistorT<float> Rs { 4700.0f };
+        wdft::WDFSeriesT<float, decltype(Vs), decltype(Rs)> S1 { Vs, Rs };
+        wdft::ResistorT<float> Rload { 10000.0f };
+        wdft::WDFParallelT<float, decltype(S1), decltype(Rload)> P1 { S1, Rload };
+        wdft::CapacitorT<float> C1 { 1.0e-6f };
+        wdft::WDFParallelT<float, decltype(P1), decltype(C1)> P2 { P1, C1 };
+        wdft::DiodePairT<float, decltype(P2)> dp { P2, 2.52e-9f };
+    };
+
+    FuzzCircuit circuit[2];
+    double sampleRate = 44100.0;
+    float drive = 1.0f;
+    float outputLevel = 1.0f;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (${pluginName}AudioProcessor)
+};
+`;
+
+  const processorCPP = `#include "${pluginName}Processor.h"
+
+static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("drive", "Drive",
+        juce::NormalisableRange<float> (0.0f, 24.0f, 0.1f), 12.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output",
+        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
+
+    return layout;
+}
+
+${pluginName}AudioProcessor::${pluginName}AudioProcessor()
+    : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "Parameters", createParameterLayout())
+{
+}
+
+void ${pluginName}AudioProcessor::prepareToPlay (double rate, int)
+{
+    sampleRate = rate;
+    for (auto& c : circuit)
+        c.prepare (rate);
+}
+
+void ${pluginName}AudioProcessor::releaseResources()
+{
+    for (auto& c : circuit)
+        c.reset();
+}
+
+void ${pluginName}AudioProcessor::FuzzCircuit::prepare (double fs)
+{
+    C1.prepare ((float) fs);
+}
+
+void ${pluginName}AudioProcessor::FuzzCircuit::reset()
+{
+    C1.reset();
+}
+
+float ${pluginName}AudioProcessor::FuzzCircuit::processSample (float x)
+{
+    float v = std::tanh (x * 2.0f);
+    Vs.setVoltage ((double) v);
+    dp.incident (P2.reflected());
+    auto y = wdft::voltage<float> (Rload);
+    P2.incident (dp.reflected());
+    return y;
+}
+
+void ${pluginName}AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+
+    drive = *apvts.getRawParameterValue ("drive");
+    outputLevel = *apvts.getRawParameterValue ("output");
+
+    float driveGain = juce::Decibels::decibelsToGain (drive);
+    float outGain = juce::Decibels::decibelsToGain (outputLevel);
+
+    for (int ch = 0; ch < totalNumInputChannels; ++ch)
+    {
+        auto* data = buffer.getWritePointer (ch);
+
+        for (int s = 0; s < buffer.getNumSamples(); ++s)
+        {
+            float x = data[s] * driveGain;
+            x = circuit[ch].processSample (x);
+            data[s] = x * outGain * 2.0f;
         }
     }
 }
@@ -518,7 +741,11 @@ export function generatePluginSource (topology) {
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   } else if (topology.type === 'diode_clipper') {
-    const gen = generateDiodeClipper(topology);
+    const gen = generateDiodeClipper();
+    processorH = gen.processorH;
+    processorCPP = gen.processorCPP;
+  } else if (topology.type === 'mini_fuzz') {
+    const gen = generateMiniFuzz();
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   } else {
@@ -527,7 +754,7 @@ export function generatePluginSource (topology) {
     processorCPP = gen.processorCPP;
   }
 
-  const useWDF = topology.type === 'diode_clipper';
+  const useWDF = topology.type === 'diode_clipper' || topology.type === 'mini_fuzz';
 
   const cmakeLists = `cmake_minimum_required(VERSION 3.20)
 project(${pluginName} VERSION 1.0.0 LANGUAGES C CXX)

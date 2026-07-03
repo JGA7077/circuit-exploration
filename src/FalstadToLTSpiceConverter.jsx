@@ -83,7 +83,7 @@ function FalstadToLTSpiceConverter() {
 
           {vst3Result && (
             <div>
-              <h4>Topology Detected: {vst3Result.topology.type === 'rc_lowpass' ? '✓ RC Low-Pass Filter' : vst3Result.topology.type === 'diode_clipper' ? '✓ Diode Clipper' : '✗ ' + vst3Result.topology.type}</h4>
+              <h4>Topology Detected: {vst3Result.topology.type === 'rc_lowpass' ? '✓ RC Low-Pass Filter' : vst3Result.topology.type === 'diode_clipper' ? '✓ Diode Clipper' : vst3Result.topology.type === 'mini_fuzz' ? '✓ Mini Fuzz' : '✗ ' + vst3Result.topology.type}</h4>
               <p style={{ fontSize: '0.9rem', color: '#666' }}>{topologyLabel(vst3Result.topology)}</p>
 
               {vst3Result.topology.type !== 'unknown' && (
