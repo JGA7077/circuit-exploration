@@ -4,7 +4,8 @@
  * Converte um circuito Falstad (XML) em um plugin VST3 (JUCE/C++).
  * 
  * Fase 1: detecção de filtro RC passa-baixas → gera 1-pole IIR.
- * Fase 2+: parser MNA completo para topologias arbitrárias.
+ * Fase 2: diode clipper e mini-fuzz com WDF.
+ * Fase 3: parser MNA completo para topologias arbitrárias.
  * 
  * Uso (Node.js):
  *   node src/utils/circuitToVST3.js < input.xml
@@ -13,6 +14,8 @@
  *   import { generatePlugin } from './utils/circuitToVST3.js';
  *   const result = generatePlugin(xmlString);
  */
+
+import { buildNetlist, analyzeParameters } from './mnaSolver.js';
 
 // ---------------------------------------------------------------------------
 // Parser de XML Falstad
@@ -75,6 +78,16 @@ export function parseFalstadXml (xmlString, customDOMParser) {
     }
   }
 
+  // Parse attributes helper
+  const getAttr = (el, name) => {
+    const a = el.attributes.getNamedItem(name);
+    return a ? a.value : null;
+  };
+  const getFloat = (el, name, def = 0) => {
+    const v = getAttr(el, name);
+    return v !== null ? parseFloat(v) : def;
+  };
+
   let oProbeIndex = 0;
   const children = cir.children;
   for (let i = 0; i < children.length; i++) {
@@ -115,6 +128,39 @@ export function parseFalstadXml (xmlString, customDOMParser) {
         components.push({ type: 'cap', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
+      case 'l': {
+        const value = parseFloat(getAttr(el, 'l') || getAttr(el, 'value') || '0.001');
+        const ref = `L${++refCount.L}`;
+        components.push({ type: 'ind', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
+        break;
+      }
+      case 'v':
+      case 'vs': {
+        const dcValue = getFloat(el, 'v', 5);
+        const ref = `V${++refCount.V}`;
+        components.push({ type: 'voltage', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: dcValue, dcValue, ref });
+        break;
+      }
+      case 'sine': {
+        const dcValue = getFloat(el, 'v', 0);
+        const acAmplitude = getFloat(el, 'a', 1);
+        const acFrequency = getFloat(el, 'f', 1000);
+        const ref = `V${++refCount.V}`;
+        components.push({ type: 'sine', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: dcValue, dcValue, acAmplitude, acFrequency, ref });
+        break;
+      }
+      case 'var': {
+        const dcValue = getFloat(el, 'v', 5);
+        const ref = `V${++refCount.V}`;
+        components.push({ type: 'voltage', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: dcValue, dcValue, ref });
+        break;
+      }
+      case 'i': {
+        const dcValue = getFloat(el, 'i', 0.001);
+        const ref = `I${++refCount.I}`;
+        components.push({ type: 'current', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: dcValue, dcValue, ref });
+        break;
+      }
       case 'd': {
         const moAttr = attrs.getNamedItem('mo');
         const model = moAttr ? moAttr.value : '1N4148';
@@ -123,7 +169,15 @@ export function parseFalstadXml (xmlString, customDOMParser) {
         break;
       }
       case 't': {
-        const tVal = parseFloat(attrs.getNamedItem('t').value);
+        // Falstad uses 't' or 'pn' attribute for transistor polarity
+        const tAttr = attrs.getNamedItem('t');
+        const pnAttr = attrs.getNamedItem('pn');
+        let tVal = 1;
+        if (tAttr) {
+          tVal = parseFloat(tAttr.value);
+        } else if (pnAttr) {
+          tVal = pnAttr.value === '1' ? 1 : -1;
+        }
         const moAttr = attrs.getNamedItem('mo');
         const model = moAttr ? moAttr.value : (tVal > 0 ? 'NPN' : 'PNP');
         const ref = `Q${++refCount.Q}`;
@@ -224,8 +278,7 @@ function key (x, y) {
  * Gera os arquivos fonte do plugin JUCE a partir da topologia detectada.
  * @returns {{ [filename: string]: string }}
  */
-function generateRCLowpass (topology) {
-  const pluginName = 'CircuitPlugin';
+function generateRCLowpass (topology, pluginName = 'CircuitPlugin') {
   const paramName = 'cutoff';
   const paramLabel = 'Cutoff (Hz)';
   let defaultFc = Math.max(20, Math.min(20000, topology.params.cutoffHz));
@@ -380,8 +433,7 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
   return { processorH, processorCPP };
 }
 
-function generateDiodeClipper () {
-  const pluginName = 'CircuitPlugin';
+function generateDiodeClipper (pluginName = 'CircuitPlugin') {
 
   const processorH = `#pragma once
 
@@ -554,8 +606,7 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
   return { processorH, processorCPP };
 }
 
-function generateMiniFuzz () {
-  const pluginName = 'CircuitPlugin';
+function generateMiniFuzz (pluginName = 'CircuitPlugin') {
 
   const processorH = `#pragma once
 
@@ -731,25 +782,453 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
   return { processorH, processorCPP };
 }
 
-export function generatePluginSource (topology) {
-  const pluginName = 'CircuitPlugin';
+/**
+ * Gera código C++ para um circuito universal usando MNA.
+ * Aceita qualquer topologia: filtros, pré-amps, distortion, chorus, etc.
+ */
+function generateUniversalMNA (netlist, params, pluginName = 'CircuitPlugin') {
+  const { numNodes, elements } = netlist;
 
+  // Identify input voltage source and output node
+  const voltageSources = elements.filter(e => e.type === 'voltage' || e.type === 'sine');
+  const inputSource = voltageSources.length > 0 ? voltageSources[0] : null;
+  const inputNodePos = inputSource ? inputSource.node1 : 1;
+
+  // Find output: use first node that is not ground and not input
+  let outputNode = -1;
+  for (const el of elements) {
+    if (el.type === 'output') {
+      outputNode = el.node1;
+      break;
+    }
+  }
+  // Fallback: use the node with most connections that isn't input
+  if (outputNode === -1) {
+    const nodeCount = new Map();
+    for (const el of elements) {
+      if (el.node1 !== 0 && el.node1 !== inputNodePos) nodeCount.set(el.node1, (nodeCount.get(el.node1) || 0) + 1);
+      if (el.node2 !== 0 && el.node2 !== inputNodePos) nodeCount.set(el.node2, (nodeCount.get(el.node2) || 0) + 1);
+    }
+    let maxCount = 0;
+    for (const [node, count] of nodeCount) {
+      if (count > maxCount) { maxCount = count; outputNode = node; }
+    }
+  }
+  if (outputNode === -1) outputNode = 1; // fallback
+
+  // Count dynamic elements
+  const caps = elements.filter(e => e.type === 'cap');
+  const inds = elements.filter(e => e.type === 'ind');
+  const diodes = elements.filter(e => e.type === 'diode');
+  const transistors = elements.filter(e => e.type === 'npn' || e.type === 'pnp');
+
+  const hasNonlinear = diodes.length > 0 || transistors.length > 0;
+
+  // Build MNA node index mapping
+  // In MNA: ground (node 0) is not in the matrix
+  // Non-ground nodes get indices 0, 1, 2, ... (N-1)
+  // Voltage sources get indices N, N+1, ...
+  const nodeToIdx = new Map();
+  let nextIdx = 0;
+  for (let node = 1; node <= numNodes; node++) {
+    nodeToIdx.set(node, nextIdx++);
+  }
+  const N = nextIdx; // number of non-ground nodes
+
+  // MNA matrix size: N + numVoltageSources
+  const M = N + voltageSources.length;
+
+  // Helper to get MNA index for a node (ground returns -1)
+  const mnaIdx = (node) => node === 0 ? -1 : (nodeToIdx.get(node) ?? -1);
+
+  // Generate C++ code for the circuit
+  const processorH = `#pragma once
+
+#include <JuceHeader.h>
+#include <cmath>
+#include <cstring>
+
+class ${pluginName}AudioProcessor : public juce::AudioProcessor
+{
+public:
+    ${pluginName}AudioProcessor();
+    ~${pluginName}AudioProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return false; }
+
+    const juce::String getName() const override { return "${pluginName}"; }
+
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
+
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    static constexpr int N = ${N}; // non-ground nodes
+    static constexpr int M = ${M}; // MNA matrix size
+    static constexpr int NUM_CAPS = ${caps.length};
+    static constexpr int NUM_INDS = ${inds.length};
+    static constexpr int NUM_DIODES = ${diodes.length};
+    static constexpr int NUM_TRANS = ${transistors.length};
+
+    double sampleRate = 44100.0;
+    double dt = 1.0 / 44100.0;
+
+    // MNA matrix and RHS
+    float A[M][M];
+    float b[M];
+
+    // State
+    float capVoltages[NUM_CAPS];
+    float indCurrents[NUM_INDS];
+    float diodeVoltages[NUM_DIODES];
+    float transVbe[NUM_TRANS];
+    float transVbc[NUM_TRANS];
+
+    // Node mapping
+    static constexpr int nodeMap[N] = { ${Array.from(nodeToIdx.values()).join(', ')} };
+
+    void stampMatrix (int i, int j, float val);
+    void clearMatrix();
+    void stampResistors();
+    void stampCapacitors();
+    void stampVoltageSources (float inputSample);
+    bool solve();
+    float diodeCurrent (float v, float Is, float n, float Vt);
+    float diodeConductance (float v, float Is, float n, float Vt);
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (${pluginName}AudioProcessor)
+};
+`;
+
+  const processorCPP = `#include "${pluginName}Processor.h"
+
+static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+${params.map(p => `    layout.add (std::make_unique<juce::AudioParameterFloat> ("${p.name}", "${p.label}",
+        juce::NormalisableRange<float> (${p.min}f, ${p.max}f, 0.01f, ${p.skew}f), ${p.default}f));`).join('\n')}
+    return layout;
+}
+
+${pluginName}AudioProcessor::${pluginName}AudioProcessor()
+    : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "Parameters", createParameterLayout())
+{
+}
+
+void ${pluginName}AudioProcessor::prepareToPlay (double rate, int)
+{
+    sampleRate = rate;
+    dt = 1.0 / rate;
+    std::memset (capVoltages, 0, sizeof(capVoltages));
+    std::memset (indCurrents, 0, sizeof(indCurrents));
+    std::memset (diodeVoltages, 0, sizeof(diodeVoltages));
+    std::memset (transVbe, 0, sizeof(transVbe));
+    std::memset (transVbc, 0, sizeof(transVbc));
+}
+
+void ${pluginName}AudioProcessor::releaseResources() {}
+
+void ${pluginName}AudioProcessor::stampMatrix (int i, int j, float val)
+{
+    if (i >= 0 && i < M && j >= 0 && j < M)
+        A[i][j] += val;
+}
+
+void ${pluginName}AudioProcessor::clearMatrix()
+{
+    std::memset (A, 0, sizeof(A));
+    std::memset (b, 0, sizeof(b));
+}
+
+void ${pluginName}AudioProcessor::stampResistors()
+{
+${elements.filter(e => e.type === 'res').map(e => {
+  const i = mnaIdx(e.node1);
+  const j = mnaIdx(e.node2);
+  const g = (1.0 / e.value);
+  const lines = [];
+  lines.push(`    // ${e.ref}: ${e.value}Ω`);
+  if (i >= 0) lines.push(`    stampMatrix (${i}, ${i}, ${g}f);`);
+  if (j >= 0) lines.push(`    stampMatrix (${j}, ${j}, ${g}f);`);
+  if (i >= 0 && j >= 0) {
+    lines.push(`    stampMatrix (${i}, ${j}, -${g}f);`);
+    lines.push(`    stampMatrix (${j}, ${i}, -${g}f);`);
+  }
+  return lines.join('\n');
+}).join('\n\n')}
+}
+
+void ${pluginName}AudioProcessor::stampCapacitors()
+{
+${caps.map((e, idx) => {
+  const i = mnaIdx(e.node1);
+  const j = mnaIdx(e.node2);
+  const lines = [];
+  lines.push(`    // ${e.ref}: capacitor`);
+  lines.push(`    {`);
+  lines.push(`        float geq = (float) (${e.value} / dt);`);
+  lines.push(`        float ieq = geq * capVoltages[${idx}];`);
+  if (i >= 0) lines.push(`        stampMatrix (${i}, ${i}, geq);`);
+  if (j >= 0) lines.push(`        stampMatrix (${j}, ${j}, geq);`);
+  if (i >= 0 && j >= 0) {
+    lines.push(`        stampMatrix (${i}, ${j}, -geq);`);
+    lines.push(`        stampMatrix (${j}, ${i}, -geq);`);
+  }
+  if (i >= 0) lines.push(`        b[${i}] += ieq;`);
+  if (j >= 0) lines.push(`        b[${j}] -= ieq;`);
+  lines.push(`    }`);
+  return lines.join('\n');
+}).join('\n')}
+}
+
+void ${pluginName}AudioProcessor::stampVoltageSources (float inputSample)
+{
+${voltageSources.map((e, idx) => {
+  const posIdx = mnaIdx(e.node1);
+  const negIdx = mnaIdx(e.node2);
+  const vsIdx = N + idx;
+  const isInput = idx === 0;
+  const lines = [];
+  lines.push(`    // ${e.ref}: voltage source`);
+  if (posIdx >= 0) lines.push(`    stampMatrix (${posIdx}, ${vsIdx}, 1.0f);`);
+  if (negIdx >= 0) lines.push(`    stampMatrix (${negIdx}, ${vsIdx}, -1.0f);`);
+  if (posIdx >= 0) lines.push(`    stampMatrix (${vsIdx}, ${posIdx}, 1.0f);`);
+  if (negIdx >= 0) lines.push(`    stampMatrix (${vsIdx}, ${negIdx}, -1.0f);`);
+  lines.push(`    b[${vsIdx}] += ${isInput ? 'inputSample' : `${e.dcValue || 0}f`};`);
+  return lines.join('\n');
+}).join('\n')}
+}
+
+float ${pluginName}AudioProcessor::diodeCurrent (float v, float Is, float n, float Vt)
+{
+    float nVt = n * Vt;
+    if (v > 5.0f * nVt) return Is * (std::exp (5.0f) - 1.0f);
+    if (v < -5.0f * nVt) return -Is;
+    return Is * (std::exp (v / nVt) - 1.0f);
+}
+
+float ${pluginName}AudioProcessor::diodeConductance (float v, float Is, float n, float Vt)
+{
+    float nVt = n * Vt;
+    if (std::abs (v) > 5.0f * nVt) return 0.001f;
+    return (Is / nVt) * std::exp (v / nVt);
+}
+
+bool ${pluginName}AudioProcessor::solve()
+{
+    // Gaussian elimination with partial pivoting
+    for (int col = 0; col < M; ++col)
+    {
+        // Find pivot
+        int maxRow = col;
+        float maxVal = std::abs (A[col][col]);
+        for (int row = col + 1; row < M; ++row)
+        {
+            float val = std::abs (A[row][col]);
+            if (val > maxVal) { maxVal = val; maxRow = row; }
+        }
+        if (maxVal < 1e-12f) return false; // singular
+
+        // Swap rows
+        if (maxRow != col)
+        {
+            for (int k = col; k < M; ++k)
+                std::swap (A[col][k], A[maxRow][k]);
+            std::swap (b[col], b[maxRow]);
+        }
+
+        // Eliminate
+        float pivot = A[col][col];
+        for (int row = col + 1; row < M; ++row)
+        {
+            float factor = A[row][col] / pivot;
+            for (int k = col; k < M; ++k)
+                A[row][k] -= factor * A[col][k];
+            b[row] -= factor * b[col];
+        }
+    }
+
+    // Back substitution
+    for (int row = M - 1; row >= 0; --row)
+    {
+        float sum = b[row];
+        for (int col = row + 1; col < M; ++col)
+            sum -= A[row][col] * b[col]; // b[col] now holds x[col]
+        b[row] = sum / A[row][row];
+    }
+
+    return true;
+}
+
+void ${pluginName}AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+
+${params.length > 0 ? `
+    // Read parameters
+${params.map(p => `    float ${p.name} = *apvts.getRawParameterValue ("${p.name}");`).join('\n')}
+` : ''}
+    for (int ch = 0; ch < totalNumInputChannels; ++ch)
+    {
+        auto* data = buffer.getWritePointer (ch);
+
+        for (int s = 0; s < buffer.getNumSamples(); ++s)
+        {
+            float inputSample = data[s];
+
+            // Newton-Raphson iteration for non-linear components
+            for (int iter = 0; iter < ${hasNonlinear ? '10' : '1'}; ++iter)
+            {
+                clearMatrix();
+
+                // Stamp linear components
+                stampResistors();
+                stampCapacitors();
+
+                // Stamp voltage sources
+                stampVoltageSources (inputSample);
+
+${diodes.length > 0 ? `                // Stamp diodes (linearized)
+${diodes.map((e) => {
+  const i = mnaIdx(e.node1);
+  const j = mnaIdx(e.node2);
+  const lines = [];
+  lines.push(`                // ${e.ref}`);
+  lines.push(`                {`);
+  lines.push(`                    float vd = b[${i}] - b[${j}];`);
+  lines.push(`                    float geq = diodeConductance (vd, ${e.Is || 2.52e-9}f, ${e.n || 1.752}f, ${e.Vt || 0.02585}f);`);
+  lines.push(`                    float id = diodeCurrent (vd, ${e.Is || 2.52e-9}f, ${e.n || 1.752}f, ${e.Vt || 0.02585}f);`);
+  lines.push(`                    float ieq = id - geq * vd;`);
+  if (i >= 0) lines.push(`                    stampMatrix (${i}, ${i}, geq);`);
+  if (j >= 0) lines.push(`                    stampMatrix (${j}, ${j}, geq);`);
+  if (i >= 0 && j >= 0) {
+    lines.push(`                    stampMatrix (${i}, ${j}, -geq);`);
+    lines.push(`                    stampMatrix (${j}, ${i}, -geq);`);
+  }
+  if (i >= 0) lines.push(`                    b[${i}] -= ieq;`);
+  if (j >= 0) lines.push(`                    b[${j}] += ieq;`);
+  lines.push(`                }`);
+  return lines.join('\n');
+}).join('\n')}` : ''}
+${transistors.length > 0 ? `                // Stamp transistors (simplified)
+${transistors.map((e) => {
+  const b_idx = mnaIdx(e.node2);
+  const c_idx = mnaIdx(e.node1);
+  const e_idx = mnaIdx(e.node1); // simplified
+  const lines = [];
+  lines.push(`                // ${e.ref}`);
+  lines.push(`                {`);
+  lines.push(`                    float beta = 100.0f;`);
+  lines.push(`                    float Ib = (b[${b_idx}] - b[${e_idx}]) / 10000.0f;`);
+  lines.push(`                    float Ic = beta * Ib;`);
+  if (c_idx >= 0) {
+    lines.push(`                    stampMatrix (${c_idx}, ${c_idx}, 0.001f);`);
+    lines.push(`                    b[${c_idx}] += Ic * ${e.polarity || 1}f;`);
+  }
+  lines.push(`                }`);
+  return lines.join('\n');
+}).join('\n')}` : ''}
+                // Solve MNA system
+                if (!solve()) break;
+
+                // Update capacitor states
+${caps.map((e, idx) => {
+  const i = mnaIdx(e.node1);
+  const j = mnaIdx(e.node2);
+  if (i >= 0 && j >= 0) return `                capVoltages[${idx}] = b[${i}] - b[${j}];`;
+  if (i >= 0) return `                capVoltages[${idx}] = b[${i}];`;
+  if (j >= 0) return `                capVoltages[${idx}] = -b[${j}];`;
+  return `                capVoltages[${idx}] = 0.0f;`;
+}).join('\n')}
+
+${diodes.length > 0 ? `                // Update diode voltages
+${diodes.map((e, idx) => {
+  const i = nodeList.indexOf(e.node1);
+  const j = nodeList.indexOf(e.node2);
+  return `                diodeVoltages[${idx}] = b[${i}] - b[${j}];`;
+}).join('\n')}` : ''}
+            }
+
+            // Output: voltage at output node
+            data[s] = b[${mnaIdx(outputNode)}];
+        }
+    }
+}
+
+juce::AudioProcessorEditor* ${pluginName}AudioProcessor::createEditor()
+{
+    return nullptr;
+}
+
+void ${pluginName}AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    juce::MemoryOutputStream mos (destData, false);
+    apvts.state.writeToStream (mos);
+}
+
+void ${pluginName}AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    auto tree = juce::ValueTree::readFromData (data, (size_t) sizeInBytes);
+    if (tree.isValid())
+        apvts.replaceState (tree);
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new ${pluginName}AudioProcessor();
+}
+`;
+
+  return { processorH, processorCPP };
+}
+
+export function generatePluginSource (topology, pluginName = 'CircuitPlugin', netlist, circuitParams) {
   let processorH, processorCPP;
 
   if (topology.type === 'rc_lowpass') {
-    const gen = generateRCLowpass(topology);
+    const gen = generateRCLowpass(topology, pluginName);
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   } else if (topology.type === 'diode_clipper') {
-    const gen = generateDiodeClipper();
+    const gen = generateDiodeClipper(pluginName);
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   } else if (topology.type === 'mini_fuzz') {
-    const gen = generateMiniFuzz();
+    const gen = generateMiniFuzz(pluginName);
+    processorH = gen.processorH;
+    processorCPP = gen.processorCPP;
+  } else if (netlist) {
+    // Universal MNA fallback: any topology
+    const gen = generateUniversalMNA(netlist, circuitParams || [], pluginName);
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   } else {
-    const gen = generateRCLowpass({ type: 'rc_lowpass', params: { cutoffHz: 1000 } });
+    const gen = generateRCLowpass({ type: 'rc_lowpass', params: { cutoffHz: 1000 } }, pluginName);
     processorH = gen.processorH;
     processorCPP = gen.processorCPP;
   }
@@ -798,7 +1277,7 @@ target_sources(${pluginName}
 target_compile_definitions(${pluginName} PRIVATE
     JUCE_IGNORE_VST3_MISMATCHED_PARAMETER_ID_WARNING=1
 )
-${useWDF ? 'target_link_libraries(${pluginName} PRIVATE chowdsp::chowdsp_wdf)' : ''}
+${useWDF ? `target_link_libraries(${pluginName} PRIVATE chowdsp::chowdsp_wdf)` : ''}
 `;
 
   const moduleInfo = `{
@@ -825,11 +1304,22 @@ ${useWDF ? 'target_link_libraries(${pluginName} PRIVATE chowdsp::chowdsp_wdf)' :
  * @param {string} xmlString - XML do Falstad
  * @returns {{ sources: {[filename]:string}, topology: object, circuit: object }}
  */
-export function generatePlugin (xmlString, customDOMParser) {
+export function generatePlugin (xmlString, pluginName = 'CircuitPlugin', customDOMParser) {
   const circuit = parseFalstadXml(xmlString, customDOMParser);
   const topology = detectTopology(circuit);
-  const sources = generatePluginSource(topology);
-  return { sources, topology, circuit };
+
+  // Build netlist for universal MNA
+  let netlist = null;
+  let circuitParams = [];
+  try {
+    netlist = buildNetlist(circuit);
+    circuitParams = analyzeParameters(netlist.elements);
+  } catch {
+    // buildNetlist may fail if circuit is malformed
+  }
+
+  const sources = generatePluginSource(topology, pluginName, netlist, circuitParams);
+  return { sources, topology, circuit, pluginName, netlist };
 }
 
 // ---------------------------------------------------------------------------

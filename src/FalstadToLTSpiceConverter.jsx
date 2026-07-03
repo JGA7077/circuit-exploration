@@ -6,6 +6,7 @@ function FalstadToLTSpiceConverter() {
   const [xmlContent, setXmlContent] = useState('');
   const [ascContent, setAscContent] = useState('');
   const [vst3Result, setVst3Result] = useState(null);
+  const [pluginName, setPluginName] = useState('CircuitPlugin');
 
   const handleFileUpload = (event) => {
     const file = event.target.files[0];
@@ -33,7 +34,7 @@ function FalstadToLTSpiceConverter() {
 
   const handleGenerateVST3 = () => {
     try {
-      const result = generatePlugin(xmlContent);
+      const result = generatePlugin(xmlContent, pluginName);
       setVst3Result(result);
     } catch (err) {
       alert('Error generating VST3: ' + err.message);
@@ -79,7 +80,17 @@ function FalstadToLTSpiceConverter() {
 
           <hr style={{ margin: '2rem 0' }} />
           <h3>Gerar VST3</h3>
-          <button onClick={handleGenerateVST3}>Generate VST3 Plugin</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
+            <label style={{ fontWeight: 'bold' }}>Nome do Plugin:</label>
+            <input
+              type="text"
+              value={pluginName}
+              onChange={(e) => setPluginName(e.target.value)}
+              placeholder="Nome do plugin"
+              style={{ padding: '0.5rem', border: '1px solid #ccc', borderRadius: '4px', flex: 1 }}
+            />
+            <button onClick={handleGenerateVST3}>Generate VST3 Plugin</button>
+          </div>
 
           {vst3Result && (
             <div>
@@ -106,10 +117,12 @@ function FalstadToLTSpiceConverter() {
                   <div style={{ marginTop: '1rem', padding: '1rem', background: '#fff3cd', borderRadius: '4px' }}>
                     <strong>Para compilar o VST3:</strong>
                     <ol>
-                      <li>Coloque os arquivos acima em uma pasta vazia</li>
-                      <li>Execute: <code>cmake -B build -G Ninja</code></li>
-                      <li>Execute: <code>cmake --build build --config Release</code></li>
-                      <li>O .vst3 estará em <code>build/CircuitPlugin_artefacts/Release/VST3/</code></li>
+                      <li>Abra o <strong>Developer Command Prompt for VS</strong> (ou x64 Native Tools)</li>
+                      <li>Navegue até a pasta com os arquivos: <code>cd caminho/para/pasta</code></li>
+                      <li>Configure: <code>cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release</code></li>
+                      <li>Compile: <code>cmake --build build --config Release</code></li>
+                      <li>O .vst3 estará em <code>build/SEU-NOME_artefacts/Release/VST3/</code></li>
+                      <li>Copie para <code>C:\Program Files\Common Files\VST3\</code></li>
                     </ol>
                   </div>
                 </>
