@@ -35,6 +35,7 @@ dist-ssr
 
 # CMake build directories
 vst3-*/build/
+mini-fuzz/build/
 
 # VST3 auto-generated output (regenerável)
 vst3-rc-test/

@@ -5,11 +5,11 @@
 
 namespace wdft = chowdsp::wdft;
 
-class CircuitPluginAudioProcessor : public juce::AudioProcessor
+class MiniFuzzAudioProcessor : public juce::AudioProcessor
 {
 public:
-    CircuitPluginAudioProcessor();
-    ~CircuitPluginAudioProcessor() override = default;
+    MiniFuzzAudioProcessor();
+    ~MiniFuzzAudioProcessor() override = default;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -19,7 +19,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return false; }
 
-    const juce::String getName() const override { return "CircuitPlugin"; }
+    const juce::String getName() const override { return "MiniFuzz"; }
 
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
@@ -37,24 +37,26 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
 private:
-    struct DiodeClipper
+    struct FuzzCircuit
     {
         void prepare (double fs);
         void reset();
         float processSample (float x);
 
-        wdft::ResistorT<float> R1 { 4700.0f };
         wdft::ResistiveVoltageSourceT<float> Vs;
-        wdft::WDFSeriesT<float, decltype(Vs), decltype(R1)> S1 { Vs, R1 };
-        wdft::CapacitorT<float> C1 { 47.0e-9f };
-        wdft::WDFParallelT<float, decltype(S1), decltype(C1)> P1 { S1, C1 };
-        wdft::DiodePairT<float, decltype(P1)> dp { P1, 2.52e-9f };
+        wdft::ResistorT<float> Rs { 4700.0f };
+        wdft::WDFSeriesT<float, decltype(Vs), decltype(Rs)> S1 { Vs, Rs };
+        wdft::ResistorT<float> Rload { 10000.0f };
+        wdft::WDFParallelT<float, decltype(S1), decltype(Rload)> P1 { S1, Rload };
+        wdft::CapacitorT<float> C1 { 1.0e-6f };
+        wdft::WDFParallelT<float, decltype(P1), decltype(C1)> P2 { P1, C1 };
+        wdft::DiodePairT<float, decltype(P2)> dp { P2, 2.52e-9f };
     };
 
-    DiodeClipper clipper[2];
+    FuzzCircuit circuit[2];
     double sampleRate = 44100.0;
     float drive = 1.0f;
     float outputLevel = 1.0f;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CircuitPluginAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MiniFuzzAudioProcessor)
 };

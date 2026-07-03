@@ -63,7 +63,7 @@ export function parseFalstadXml (xmlString, customDOMParser) {
   const outputs = [];
   const outputNames = [];
 
-  const refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0, Q: 0 };
+  const refCount = { R: 0, V: 0, C: 0, L: 0, I: 0, D: 0 };
 
   // Coletar nomes de saída (tags <o> sem coordenadas)
   const oConfigs = cir.getElementsByTagName('o');
@@ -108,10 +108,18 @@ export function parseFalstadXml (xmlString, customDOMParser) {
         components.push({ type: 'res', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
         break;
       }
-      case 'c': {
+      case 'c':
+      case 'pc': {
         const value = parseFloat(attrs.getNamedItem('c').value);
         const ref = `C${++refCount.C}`;
         components.push({ type: 'cap', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value, ref });
+        break;
+      }
+      case 'd': {
+        const moAttr = attrs.getNamedItem('mo');
+        const model = moAttr ? moAttr.value : '1N4148';
+        const ref = `D${++refCount.D}`;
+        components.push({ type: 'diode', x1: coords[0], y1: coords[1], x2: coords[2], y2: coords[3], value: model, ref });
         break;
       }
       case 'g':
@@ -125,122 +133,45 @@ export function parseFalstadXml (xmlString, customDOMParser) {
   return { wires, components, grounds, outputs };
 }
 
-// ---------------------------------------------------------------------------
-// Topologia: detecção de filtro RC passa-baixas
-// ---------------------------------------------------------------------------
-
-/**
- * Constrói um mapa de nós a partir de fios e componentes.
- * Cada nó é identificado por uma coordenada (x,y).
- * Retorna { nodeMap, nodeOfCoord } onde nodeMap[n] = [{type, ref, pin}, ...]
- */
-function buildNodeMap ({ wires, components, grounds }) {
-  // Agrupar coordenadas conectadas por fios (flood fill)
-  const adj = new Map(); // "x,y" → Set de "x2,y2"
-  const key = (x, y) => `${Math.round(x)},${Math.round(y)}`;
-
-  function addEdge (x1, y1, x2, y2) {
-    const k1 = key(x1, y1), k2 = key(x2, y2);
-    if (k1 === k2) return;
-    if (!adj.has(k1)) adj.set(k1, new Set());
-    if (!adj.has(k2)) adj.set(k2, new Set());
-    adj.get(k1).add(k2);
-    adj.get(k2).add(k1);
-  }
-
-  wires.forEach(w => addEdge(w.x1, w.y1, w.x2, w.y2));
-
-  // Adicionar terminais de componentes como conectados a si mesmos
-  components.forEach(c => {
-    if (!adj.has(key(c.x1, c.y1))) adj.set(key(c.x1, c.y1), new Set());
-    if (!adj.has(key(c.x2, c.y2))) adj.set(key(c.x2, c.y2), new Set());
-  });
-  grounds.forEach(g => {
-    if (!adj.has(key(g.x, g.y))) adj.set(key(g.x, g.y), new Set());
-  });
-
-  // Flood fill para agrupar nós conectados
-  const visited = new Set();
-  const nodeMap = new Map(); // nodeId → [{type, ref, pin, x, y}, ...]
-  const nodeOfCoord = new Map(); // "x,y" → nodeId
-
-  let nextNodeId = 0;
-  for (const [k] of adj) {
-    if (visited.has(k)) continue;
-    const stack = [k];
-    const group = [];
-    while (stack.length > 0) {
-      const cur = stack.pop();
-      if (visited.has(cur)) continue;
-      visited.add(cur);
-      group.push(cur);
-      for (const nb of (adj.get(cur) || [])) {
-        if (!visited.has(nb)) stack.push(nb);
-      }
-    }
-    const nodeId = nextNodeId++;
-    group.forEach(coord => { nodeOfCoord.set(coord, nodeId); });
-    nodeMap.set(nodeId, []);
-  }
-
-  // Associar componentes aos nós
-  components.forEach(c => {
-    const n1 = nodeOfCoord.get(key(c.x1, c.y1));
-    const n2 = nodeOfCoord.get(key(c.x2, c.y2));
-    if (n1 !== undefined && nodeMap.has(n1)) nodeMap.get(n1).push({ type: c.type, ref: c.ref, pin: 1, x: c.x1, y: c.y1 });
-    if (n2 !== undefined && nodeMap.has(n2)) nodeMap.get(n2).push({ type: c.type, ref: c.ref, pin: 2, x: c.x2, y: c.y2 });
-  });
-
-  // Associar grounds aos nós
-  grounds.forEach(g => {
-    const n = nodeOfCoord.get(key(g.x, g.y));
-    if (n !== undefined && nodeMap.has(n)) nodeMap.get(n).push({ type: 'gnd', ref: '0', pin: 0, x: g.x, y: g.y });
-  });
-
-  return { nodeMap, nodeOfCoord };
-}
-
 /**
  * Detecta a topologia do circuito.
  * Retorna { type, params } ou { type: 'unknown' }.
  */
 export function detectTopology (circuit) {
-  const { nodeMap } = buildNodeMap(circuit);
   const components = circuit.components;
   const res = components.filter(c => c.type === 'res');
   const caps = components.filter(c => c.type === 'cap');
+  const diodes = components.filter(c => c.type === 'diode');
+
+  // Diode clipper: 1+ resistor + 1+ capacitor + 1+ diodo
+  // Detect BEFORE RC low-pass since diodes would also match RC
+  if (diodes.length >= 1 && res.length >= 1 && caps.length >= 1) {
+    const firstR = res[0];
+    const firstC = caps[0];
+    const firstD = diodes[0];
+    return {
+      type: 'diode_clipper',
+      params: {
+        rValue: firstR.value,
+        cValue: firstC.value,
+        diodeModel: firstD.value,
+        numDiodes: diodes.length,
+        refs: { r: firstR.ref, c: firstC.ref, d: firstD.ref }
+      }
+    };
+  }
 
   // RC low-pass: 1 resistor + 1 capacitor compartilhando um nó
   if (res.length === 1 && caps.length === 1) {
     const r = res[0];
     const c = caps[0];
 
-    // Verificar que R e C compartilham um terminal
-    const sharedKey1 = key(r.x1, r.y1);
-    const sharedKey2 = key(r.x2, r.y2);
+    const sk1 = key(r.x1, r.y1);
+    const sk2 = key(r.x2, r.y2);
+    const ck = [key(c.x1, c.y1), key(c.x2, c.y2)];
 
-    const ck1 = key(c.x1, c.y1);
-    const ck2 = key(c.x2, c.y2);
-
-    let midNode, inKey, outKey;
-    if (sharedKey1 === ck1 || sharedKey1 === ck2) {
-      midNode = sharedKey1;
-      inKey = sharedKey2;
-    } else if (sharedKey2 === ck1 || sharedKey2 === ck2) {
-      midNode = sharedKey2;
-      inKey = sharedKey1;
-    } else {
+    if (sk1 !== ck[0] && sk1 !== ck[1] && sk2 !== ck[0] && sk2 !== ck[1])
       return { type: 'unknown', reason: 'R and C do not share a node' };
-    }
-
-    const sharedCKeys = [ck1, ck2];
-    const cOtherKey = sharedCKeys.find(k => k !== midNode);
-
-    // Verificar ground no terminal livre do capacitor
-    const { nodeOfCoord } = buildNodeMap(circuit);
-    const gndKey = circuit.grounds.length > 0
-      ? key(circuit.grounds[0].x, circuit.grounds[0].y)
-      : null;
 
     const fc = 1.0 / (2.0 * Math.PI * r.value * c.value);
 
@@ -270,28 +201,17 @@ function key (x, y) {
  * Gera os arquivos fonte do plugin JUCE a partir da topologia detectada.
  * @returns {{ [filename: string]: string }}
  */
-export function generatePluginSource (topology) {
+function generateRCLowpass (topology) {
+  const pluginName = 'CircuitPlugin';
   const paramName = 'cutoff';
   const paramLabel = 'Cutoff (Hz)';
-  let defaultFc, paramRange;
+  let defaultFc = Math.max(20, Math.min(20000, topology.params.cutoffHz));
+  const paramRange = { min: 20, max: 20000, skew: 0.3 };
 
-  if (topology.type === 'rc_lowpass') {
-    defaultFc = topology.params.cutoffHz;
-  } else {
-    defaultFc = 1000;
-  }
-
-  // Limitar faixa do parâmetro
-  defaultFc = Math.max(20, Math.min(20000, defaultFc));
-  paramRange = { min: 20, max: 20000, skew: 0.3 };
-
-    // Formatar como literal float C++ válido (sempre com ponto decimal)
   let fcStr = defaultFc.toPrecision(3);
-  // Garantir que tenha ponto decimal (ex: 159 → 159.0)
   if (!fcStr.includes('.')) fcStr += '.0';
   defaultFc = fcStr;
 
-  const pluginName = 'CircuitPlugin';
   const processorH = `#pragma once
 
 #include <JuceHeader.h>
@@ -378,7 +298,6 @@ void ${pluginName}AudioProcessor::updateCoefficients (double fs)
     if (fc < 1.0f) fc = 1.0f;
     if (fc >= (float)fs * 0.49f) fc = (float)fs * 0.49f;
 
-    // 1-pole RC low-pass: y[n] = a * x[n] + (1-a) * y[n-1]
     float a = 1.0f - std::exp (-2.0f * juce::MathConstants<float>::pi * fc / (float)fs);
     b0 = a;
     a1 = 1.0f - a;
@@ -435,6 +354,181 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 }
 `;
 
+  return { processorH, processorCPP };
+}
+
+function generateDiodeClipper () {
+  const pluginName = 'CircuitPlugin';
+
+  const processorH = `#pragma once
+
+#include <JuceHeader.h>
+#include <chowdsp_wdf/chowdsp_wdf.h>
+
+namespace wdft = chowdsp::wdft;
+
+class ${pluginName}AudioProcessor : public juce::AudioProcessor
+{
+public:
+    ${pluginName}AudioProcessor();
+    ~${pluginName}AudioProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return false; }
+
+    const juce::String getName() const override { return "${pluginName}"; }
+
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
+
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
+
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    // WDF tree: ResistiveSource -> Series(R2) -> Parallel(R1 || C1 || DiodePair)
+    wdft::ResistiveVoltageSourceT<float> source;
+    wdft::ResistorT<float> r1, r2;
+    wdft::CapacitorT<float> c1;
+    wdft::DiodePairT<float, decltype(c1)::Next> diodePair;
+    wdft::WDFParallelT<float, decltype(r1)::Next, decltype(diodePair)::Next> p1;
+    wdft::WDFSeriesT<float, decltype(r2)::Next, decltype(p1)::Next> s1;
+
+    double sampleRate = 44100.0;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (${pluginName}AudioProcessor)
+};
+`;
+
+  const processorCPP = `#include "${pluginName}Processor.h"
+
+static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("drive", "Drive (dB)",
+        juce::NormalisableRange<float> (-12.0f, 24.0f, 0.1f), 12.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output (dB)",
+        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
+
+    return layout;
+}
+
+${pluginName}AudioProcessor::${pluginName}AudioProcessor()
+    : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "Parameters", createParameterLayout()),
+      r1 (1000.0f),
+      r2 (4700.0f),
+      c1 (1.0e-6f),
+      diodePair (2.52e-9f),
+      p1 (r1, diodePair),
+      s1 (r2, p1)
+{
+}
+
+void ${pluginName}AudioProcessor::prepareToPlay (double rate, int)
+{
+    sampleRate = rate;
+    c1.prepare (rate);
+}
+
+void ${pluginName}AudioProcessor::releaseResources()
+{
+}
+
+void ${pluginName}AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+
+    float driveLin = std::pow (10.0f, *apvts.getRawParameterValue ("drive") / 20.0f);
+    float outputLin = std::pow (10.0f, *apvts.getRawParameterValue ("output") / 20.0f);
+
+    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    {
+        auto* data = buffer.getWritePointer (channel);
+
+        for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+        {
+            float in = data[sample] * driveLin;
+
+            source.setVoltage ((double) in);
+            source.incident (s1.reflected());
+            auto y = (float) chowdsp::wdft::voltage<double> (r1);
+            s1.incident (source.reflected());
+
+            data[sample] = y * outputLin;
+        }
+    }
+}
+
+juce::AudioProcessorEditor* ${pluginName}AudioProcessor::createEditor()
+{
+    return nullptr;
+}
+
+void ${pluginName}AudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    juce::MemoryOutputStream mos (destData, false);
+    apvts.state.writeToStream (mos);
+}
+
+void ${pluginName}AudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    auto tree = juce::ValueTree::readFromData (data, (size_t) sizeInBytes);
+    if (tree.isValid())
+        apvts.replaceState (tree);
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new ${pluginName}AudioProcessor();
+}
+`;
+
+  return { processorH, processorCPP };
+}
+
+export function generatePluginSource (topology) {
+  const pluginName = 'CircuitPlugin';
+
+  let processorH, processorCPP;
+
+  if (topology.type === 'rc_lowpass') {
+    const gen = generateRCLowpass(topology);
+    processorH = gen.processorH;
+    processorCPP = gen.processorCPP;
+  } else if (topology.type === 'diode_clipper') {
+    const gen = generateDiodeClipper(topology);
+    processorH = gen.processorH;
+    processorCPP = gen.processorCPP;
+  } else {
+    const gen = generateRCLowpass({ type: 'rc_lowpass', params: { cutoffHz: 1000 } });
+    processorH = gen.processorH;
+    processorCPP = gen.processorCPP;
+  }
+
+  const useWDF = topology.type === 'diode_clipper';
+
   const cmakeLists = `cmake_minimum_required(VERSION 3.20)
 project(${pluginName} VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -447,7 +541,14 @@ FetchContent_Declare(JUCE
     GIT_TAG master
 )
 FetchContent_MakeAvailable(JUCE)
-
+${useWDF ? `
+FetchContent_Declare(chowdsp_wdf
+    GIT_REPOSITORY https://github.com/Chowdhury-DSP/chowdsp_wdf.git
+    GIT_TAG main
+)
+set(CHOWDSP_WDF_BUILD_TESTS OFF CACHE BOOL "")
+FetchContent_MakeAvailable(chowdsp_wdf)
+` : ''}
 juce_add_plugin(${pluginName}
     COMPANY_NAME "CircuitExploration"
     PLUGIN_MANUFACTURER_CODE CExp
@@ -470,6 +571,7 @@ target_sources(${pluginName}
 target_compile_definitions(${pluginName} PRIVATE
     JUCE_IGNORE_VST3_MISMATCHED_PARAMETER_ID_WARNING=1
 )
+${useWDF ? 'target_link_libraries(${pluginName} PRIVATE chowdsp::chowdsp_wdf)' : ''}
 `;
 
   const moduleInfo = `{

@@ -1,59 +1,60 @@
 #include "PluginProcessor.h"
 
-namespace wdft = chowdsp::wdft;
-
 static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    layout.add (std::make_unique<juce::AudioParameterFloat> ("drive", "Drive (dB)",
-        juce::NormalisableRange<float> (0.0f, 30.0f, 0.1f), 0.0f));
-    layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output (dB)",
-        juce::NormalisableRange<float> (-30.0f, 6.0f, 0.1f), 0.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("drive", "Drive",
+        juce::NormalisableRange<float> (0.0f, 24.0f, 0.1f), 12.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("output", "Output",
+        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
 
     return layout;
 }
 
-CircuitPluginAudioProcessor::CircuitPluginAudioProcessor()
+MiniFuzzAudioProcessor::MiniFuzzAudioProcessor()
     : AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
 }
 
-void CircuitPluginAudioProcessor::prepareToPlay (double rate, int)
+void MiniFuzzAudioProcessor::prepareToPlay (double rate, int)
 {
     sampleRate = rate;
-    for (auto& c : clipper)
+    for (auto& c : circuit)
         c.prepare (rate);
 }
 
-void CircuitPluginAudioProcessor::releaseResources()
+void MiniFuzzAudioProcessor::releaseResources()
 {
-    for (auto& c : clipper)
+    for (auto& c : circuit)
         c.reset();
 }
 
-void CircuitPluginAudioProcessor::DiodeClipper::prepare (double fs)
+void MiniFuzzAudioProcessor::FuzzCircuit::prepare (double fs)
 {
     C1.prepare ((float) fs);
 }
 
-void CircuitPluginAudioProcessor::DiodeClipper::reset()
+void MiniFuzzAudioProcessor::FuzzCircuit::reset()
 {
     C1.reset();
 }
 
-float CircuitPluginAudioProcessor::DiodeClipper::processSample (float x)
+float MiniFuzzAudioProcessor::FuzzCircuit::processSample (float x)
 {
-    Vs.setVoltage (x);
-    dp.incident (P1.reflected());
-    auto y = wdft::voltage<float> (C1);
-    P1.incident (dp.reflected());
+    // Pre-saturation (BC517 Darlington stage)
+    float v = std::tanh (x * 2.0f);
+
+    Vs.setVoltage ((double) v);
+    dp.incident (P2.reflected());
+    auto y = wdft::voltage<float> (Rload);
+    P2.incident (dp.reflected());
     return y;
 }
 
-void CircuitPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void MiniFuzzAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
@@ -76,24 +77,24 @@ void CircuitPluginAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer
         for (int s = 0; s < buffer.getNumSamples(); ++s)
         {
             float x = data[s] * driveGain;
-            x = clipper[ch].processSample (x);
-            data[s] = x * outGain;
+            x = circuit[ch].processSample (x);
+            data[s] = x * outGain * 2.0f;
         }
     }
 }
 
-juce::AudioProcessorEditor* CircuitPluginAudioProcessor::createEditor()
+juce::AudioProcessorEditor* MiniFuzzAudioProcessor::createEditor()
 {
     return nullptr;
 }
 
-void CircuitPluginAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+void MiniFuzzAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::MemoryOutputStream mos (destData, false);
     apvts.state.writeToStream (mos);
 }
 
-void CircuitPluginAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void MiniFuzzAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     auto tree = juce::ValueTree::readFromData (data, (size_t) sizeInBytes);
     if (tree.isValid())
@@ -102,5 +103,5 @@ void CircuitPluginAudioProcessor::setStateInformation (const void* data, int siz
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new CircuitPluginAudioProcessor();
+    return new MiniFuzzAudioProcessor();
 }
