@@ -25,3 +25,19 @@ dist-ssr
 
 /sym
 .opencode
+
+# Build artifacts
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# CMake build directories
+vst3-*/build/
+
+# VST3 auto-generated output (regenerável)
+vst3-rc-test/
+
+# Outros
+video-transcript.txt
